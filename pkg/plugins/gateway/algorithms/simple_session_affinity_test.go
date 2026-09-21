@@ -624,8 +624,8 @@ func TestSessionAffinityClaimDoesNotOverwriteExistingPin(t *testing.T) {
 	const sessionKey = "claim-race"
 	cacheKey := sessionCacheKey("model1", sessionKey)
 
-	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
-	assert.False(t, routerB.persistSessionKeyToRedis(cacheKey, "10.0.0.2:8000", writeClaim),
+	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
+	assert.False(t, routerB.persistSessionKeyToRedis(cacheKey, "10.0.0.2:8000", sessionAffinityWrite{mode: writeClaim}),
 		"the losing claim must report that Redis was not written")
 
 	got, err := mr.Get(sessionAffinityRedisKey(cacheKey))
@@ -643,7 +643,7 @@ func TestSessionAffinitySyncRetryDoesNotClobberAnotherReplicasPin(t *testing.T) 
 	const sessionKey = "sync-retry-race"
 	cacheKey := sessionCacheKey("model1", sessionKey)
 
-	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 	routerB.storeSessionKeyLocal(cacheKey, "10.0.0.2:8000", false)
 	routerB.handleSessionKeyCacheSyncMiss(cacheKey)
 
@@ -672,7 +672,7 @@ func TestSessionAffinityRouteConvergesLostClaimToWinner(t *testing.T) {
 		newPod("pod-a", "10.0.0.1", true, map[string]string{"model.aibrix.ai/port": "8000"}),
 		newPod("pod-b", "10.0.0.2", true, map[string]string{"model.aibrix.ai/port": "8000"}),
 	}
-	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 
 	// Replica B holds an unconfirmed local pin for pod-b: its own claim never landed.
 	routerB.storeSessionKeyLocal(cacheKey, "10.0.0.2:8000", false)
@@ -692,15 +692,15 @@ func TestSessionAffinityRouteConvergesLostClaimToWinner(t *testing.T) {
 	assert.Equal(t, "10.0.0.1:8000", got, "the losing claim must never overwrite the winner")
 }
 
-// TestSessionAffinityPostRouteUpdateDoesNotOverwriteExistingPin covers the paths that bypass
-// Route (the single-ready-pod fast path and blended commits): they cannot tell whether Redis
-// already holds a pinning, so they must claim, not refresh.
-func TestSessionAffinityPostRouteUpdateDoesNotOverwriteExistingPin(t *testing.T) {
+// TestSessionAffinityPostRouteUpdateRepinsExistingPin covers paths that bypass Route, including
+// the single-ready-pod fast path and blended commits. Their final target is authoritative for
+// this request, so an existing pin must move to it through the read-then-CAS path.
+func TestSessionAffinityPostRouteUpdateRepinsExistingPin(t *testing.T) {
 	routerA, mr := newTestSessionAffinityRedis(t)
 	routerB := &sessionAffinityRouter{redisClient: routerA.redisClient}
 	const sessionKey = "post-route-claim"
 	cacheKey := sessionCacheKey("model1", sessionKey)
-	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 
 	podB := newPod("pod-b", "10.0.0.2", true, map[string]string{"model.aibrix.ai/port": "8000"})
 	ctx := types.NewRoutingContext(context.Background(), "test", "model1", "", "", "")
@@ -709,18 +709,18 @@ func TestSessionAffinityPostRouteUpdateDoesNotOverwriteExistingPin(t *testing.T)
 
 	require.Eventually(t, func() bool {
 		cached, confirmed, ok := routerB.loadCachedAddr(cacheKey)
-		return ok && confirmed && cached == "10.0.0.1:8000"
+		return ok && confirmed && cached == "10.0.0.2:8000"
 	}, 2*time.Second, 10*time.Millisecond,
-		"a bypass path must converge on the winner, not overwrite it")
+		"a bypass path must confirm the final target after repinning it")
 
 	got, err := mr.Get(sessionAffinityRedisKey(cacheKey))
 	require.NoError(t, err)
-	assert.Equal(t, "10.0.0.1:8000", got, "PostRouteUpdate must not overwrite an existing pin")
+	assert.Equal(t, "10.0.0.2:8000", got, "PostRouteUpdate must repin to the final target")
 }
 
 // TestSessionAffinityPostRouteUpdateSlidesTTL covers the steady state of the post-route
-// paths: the claim write keeps failing against this replica's own pin, so the read-back must
-// also slide the TTL, or an actively used session expires on the idle clock.
+// paths: when the final target already matches the stored pin, the gated refresh must slide
+// the TTL or an actively used session expires on the idle clock.
 func TestSessionAffinityPostRouteUpdateSlidesTTL(t *testing.T) {
 	routerA, mr := newTestSessionAffinityRedis(t)
 	routerB := &sessionAffinityRouter{redisClient: routerA.redisClient}
@@ -728,7 +728,7 @@ func TestSessionAffinityPostRouteUpdateSlidesTTL(t *testing.T) {
 	cacheKey := sessionCacheKey("model1", sessionKey)
 
 	podA := newPod("pod-a", "10.0.0.1", true, map[string]string{"model.aibrix.ai/port": "8000"})
-	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, routerA.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 
 	// Let the pin age halfway to expiry, then run one request through the post-route path.
 	mr.FastForward(sessionAffinityTTL / 2)
@@ -744,8 +744,7 @@ func TestSessionAffinityPostRouteUpdateSlidesTTL(t *testing.T) {
 }
 
 // TestSessionAffinityResolveReportsPersistIntent pins the write intent resolveSessionPod reports
-// for each case, since Route/PostRouteUpdate use it to decide between the atomic claim write and
-// the unconditional write (the gated refresh and repin CAS build on this distinction next).
+// for each case, since Route uses it to select the atomic claim, refresh, or repin operation.
 func TestSessionAffinityResolveReportsPersistIntent(t *testing.T) {
 	ctx := types.NewRoutingContext(context.Background(), "test", "model1", "", "", "")
 	ctx.ReqHeaders = map[string]string{constants.HeaderSessionKey: "write-intent"}
@@ -759,20 +758,20 @@ func TestSessionAffinityResolveReportsPersistIntent(t *testing.T) {
 	// Nothing pinned anywhere: the rendezvous pick creates a new pinning.
 	_, _, via, mode := router.resolveSessionPod(ctx, []*v1.Pod{podA, podB})
 	require.Equal(t, "rendezvous", via)
-	assert.Equal(t, writeClaim, mode)
+	assert.Equal(t, sessionAffinityWrite{mode: writeClaim}, mode)
 
 	// Redis already pins a ready pod: the resolve re-affirms it.
 	require.NoError(t, mr.Set(sessionAffinityRedisKey(cacheKey), "10.0.0.1:8000"))
 	_, _, via, mode = router.resolveSessionPod(ctx, []*v1.Pod{podA, podB})
 	require.Equal(t, "session-key-redis", via)
-	assert.Equal(t, writeRefresh, mode)
+	assert.Equal(t, sessionAffinityWrite{mode: writeRefresh}, mode)
 
 	// Redis pins a pod that is gone from this replica's ready view: the rendezvous pick replaces it.
 	fresh := &sessionAffinityRouter{redisClient: router.redisClient}
 	require.NoError(t, mr.Set(sessionAffinityRedisKey(cacheKey), "10.0.0.9:8000"))
 	_, _, via, mode = fresh.resolveSessionPod(ctx, []*v1.Pod{podA, podB})
 	require.Equal(t, "rendezvous", via)
-	assert.Equal(t, writeRepin, mode)
+	assert.Equal(t, sessionAffinityWrite{mode: writeRepin, oldAddr: "10.0.0.9:8000"}, mode)
 
 	// A local hit whose Redis write is not known to have landed is still a claim: persisting
 	// it must not use the unconditional write.
@@ -780,14 +779,14 @@ func TestSessionAffinityResolveReportsPersistIntent(t *testing.T) {
 	localLoser.storeSessionKeyLocal(cacheKey, "10.0.0.1:8000", false)
 	_, _, via, mode = localLoser.resolveSessionPod(ctx, []*v1.Pod{podA, podB})
 	require.Equal(t, "session-key-cache", via)
-	assert.Equal(t, writeClaim, mode)
+	assert.Equal(t, sessionAffinityWrite{mode: writeClaim}, mode)
 
 	// A confirmed local hit is the one case where a plain TTL refresh is safe.
 	localWinner := &sessionAffinityRouter{redisClient: router.redisClient}
 	localWinner.storeSessionKeyLocal(cacheKey, "10.0.0.1:8000", true)
 	_, _, via, mode = localWinner.resolveSessionPod(ctx, []*v1.Pod{podA, podB})
 	require.Equal(t, "session-key-cache", via)
-	assert.Equal(t, writeRefresh, mode)
+	assert.Equal(t, sessionAffinityWrite{mode: writeRefresh}, mode)
 }
 
 // TestSessionAffinityRefreshDoesNotRevertNewerRepin is a regression test for the second race
@@ -801,14 +800,14 @@ func TestSessionAffinityRefreshDoesNotRevertNewerRepin(t *testing.T) {
 	key := sessionAffinityRedisKey(cacheKey)
 
 	// This replica carries the session on pod-a and would slide its pin...
-	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 	router.storeSessionKeyLocal(cacheKey, "10.0.0.1:8000", true)
 
 	// ...but another replica repinned the session to pod-b while the refresh was in flight.
 	require.NoError(t, mr.Set(key, "10.0.0.2:8000"))
 	mr.SetTTL(key, 30*time.Minute)
 
-	assert.False(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeRefresh),
+	assert.False(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeRefresh}),
 		"a refresh that no longer matches the stored value must report that Redis was not written")
 
 	got, err := mr.Get(key)
@@ -832,10 +831,10 @@ func TestSessionAffinityRefreshReattachesLostPin(t *testing.T) {
 	cacheKey := sessionCacheKey("model1", "refresh-reattach")
 	key := sessionAffinityRedisKey(cacheKey)
 
-	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 	mr.FastForward(sessionAffinityTTL + time.Minute)
 
-	assert.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeRefresh),
+	assert.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeRefresh}),
 		"a refresh of an expired pin must re-attach it")
 	got, err := mr.Get(key)
 	require.NoError(t, err)
@@ -851,12 +850,63 @@ func TestSessionAffinityRefreshExtendsMatchingPin(t *testing.T) {
 	cacheKey := sessionCacheKey("model1", "refresh-extend")
 	key := sessionAffinityRedisKey(cacheKey)
 
-	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeClaim))
+	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
 	mr.FastForward(sessionAffinityTTL / 2)
 
-	assert.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", writeRefresh))
+	assert.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeRefresh}))
 	got, err := mr.Get(key)
 	require.NoError(t, err)
 	assert.Equal(t, "10.0.0.1:8000", got)
 	assert.Equal(t, sessionAffinityTTL, mr.TTL(key), "a matching refresh slides the TTL back out")
+}
+
+// TestSessionAffinityRepinDoesNotOverwriteNewerPin covers a delayed failover write: after the
+// request observed pod-a, another replica moved the pin to pod-c before this replica tried to
+// move it to pod-b. The oldAddr -> newAddr CAS must reject the stale write, preserve pod-c's
+// TTL, and converge the local cache on pod-c.
+func TestSessionAffinityRepinDoesNotOverwriteNewerPin(t *testing.T) {
+	router, mr := newTestSessionAffinityRedis(t)
+	cacheKey := sessionCacheKey("model1", "repin-race")
+	key := sessionAffinityRedisKey(cacheKey)
+
+	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
+	router.storeSessionKeyLocal(cacheKey, "10.0.0.2:8000", false)
+	require.NoError(t, mr.Set(key, "10.0.0.3:8000"))
+	mr.SetTTL(key, 30*time.Minute)
+
+	assert.False(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.2:8000", sessionAffinityWrite{
+		mode:    writeRepin,
+		oldAddr: "10.0.0.1:8000",
+	}), "a repin whose observed value is stale must report that Redis was not written")
+
+	got, err := mr.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.3:8000", got, "a delayed repin must not overwrite a newer pin")
+	assert.Equal(t, 30*time.Minute, mr.TTL(key), "a rejected repin must not extend the newer pin TTL")
+
+	cached, confirmed, ok := router.loadCachedAddr(cacheKey)
+	require.True(t, ok)
+	assert.True(t, confirmed)
+	assert.Equal(t, "10.0.0.3:8000", cached, "the stale replica must adopt the newer pin")
+}
+
+// TestSessionAffinityRepinReattachesLostPin covers expiry between resolution and the CAS. A
+// missing key can be attached to the final target safely because the Lua script runs atomically;
+// if another writer owns the key first, the mismatch path above leaves it untouched.
+func TestSessionAffinityRepinReattachesLostPin(t *testing.T) {
+	router, mr := newTestSessionAffinityRedis(t)
+	cacheKey := sessionCacheKey("model1", "repin-reattach")
+	key := sessionAffinityRedisKey(cacheKey)
+
+	require.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.1:8000", sessionAffinityWrite{mode: writeClaim}))
+	mr.FastForward(sessionAffinityTTL + time.Minute)
+
+	assert.True(t, router.persistSessionKeyToRedis(cacheKey, "10.0.0.2:8000", sessionAffinityWrite{
+		mode:    writeRepin,
+		oldAddr: "10.0.0.1:8000",
+	}), "a repin whose old value expired must attach the final target")
+	got, err := mr.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.2:8000", got)
+	assert.Equal(t, sessionAffinityTTL, mr.TTL(key), "the re-attached pin gets the full TTL")
 }
