@@ -82,6 +82,10 @@ type RemoteDecodeLoad struct {
 // identified by podKey (namespace/name).
 type DecodeLedgerProvider func(podKey string) DecodeLedgerState
 
+// ContextDecodeLedgerProvider reads one pod's ledger under ctx. It must honor
+// cancellation in blocking reads and return an error instead of a partial state.
+type ContextDecodeLedgerProvider func(ctx context.Context, podKey string) (DecodeLedgerState, error)
+
 func decodeLedgerKey(podKey string) string {
 	return decodeLedgerKeyPrefix + ":" + podKey
 }
@@ -121,23 +125,38 @@ func (c *Store) SharedDecodeLedgerAvailable() bool {
 // does nothing: a router constructed later serves the requests, so its ledger
 // is the one that counts.
 func (c *Store) PublishDecodeLedger(provider DecodeLedgerProvider) func(podKey string) {
-	if c.redisClient == nil || provider == nil {
+	if provider == nil {
 		return func(string) {}
 	}
-	p := newDecodeLedgerPublisher(c, provider)
+	notify, _ := c.PublishDecodeLedgerWithContext(c.runtimeContext(), func(_ context.Context, podKey string) (DecodeLedgerState, error) {
+		return provider(podKey), nil
+	})
+	return notify
+}
+
+// PublishDecodeLedgerWithContext owns publication under both lifetime and the
+// Store lifetime. It returns a dirty notification and idempotent cleanup that
+// cancels and awaits this registration. Replacement cleans up the prior one.
+// Provider errors prevent publication and retain dirty entries for retry;
+// canceled registrations stop without publishing an incomplete ledger.
+func (c *Store) PublishDecodeLedgerWithContext(lifetime context.Context, provider ContextDecodeLedgerProvider) (func(string), func()) {
+	if c.redisClient == nil || provider == nil {
+		return func(string) {}, func() {}
+	}
+	p := newDecodeLedgerPublisherWithContext(lifetime, c, provider)
 	if old := c.decodeLedger.Swap(p); old != nil {
 		klog.V(2).Info("decode ledger registered again; the later registration replaces the earlier one")
 		old.close()
 	}
 	p.start()
-	return p.markDirty
+	return p.markDirty, p.close
 }
 
 // decodeLedgerPublisher writes this gateway's decode ledger to Redis from one
 // goroutine, so the writes for a pod reach Redis in the order they were made.
 type decodeLedgerPublisher struct {
 	store    *Store
-	provider DecodeLedgerProvider
+	provider ContextDecodeLedgerProvider
 
 	mu sync.Mutex
 	// dirty is the pods whose ledger changed since the last flush.
@@ -146,14 +165,26 @@ type decodeLedgerPublisher struct {
 	// every decodeLedgerRepublishInterval, and cleared once written as zero.
 	published map[string]struct{}
 
-	wake      chan struct{}
-	done      chan struct{}
-	closeOnce sync.Once
+	wake chan struct{}
+	done chan struct{}
 	// stopped is closed when run returns; nil until run starts.
-	stopped chan struct{}
+	stopped   chan struct{}
+	lifetime  context.Context
+	cancel    context.CancelFunc
+	stopStore func() bool
+	launchMu  sync.Mutex
+	launched  bool
+	stopping  bool
 }
 
 func newDecodeLedgerPublisher(store *Store, provider DecodeLedgerProvider) *decodeLedgerPublisher {
+	return newDecodeLedgerPublisherWithContext(store.runtimeContext(), store, func(_ context.Context, podKey string) (DecodeLedgerState, error) {
+		return provider(podKey), nil
+	})
+}
+
+func newDecodeLedgerPublisherWithContext(lifetime context.Context, store *Store, provider ContextDecodeLedgerProvider) *decodeLedgerPublisher {
+	lifetime, cancel := context.WithCancel(lifetime)
 	return &decodeLedgerPublisher{
 		store:     store,
 		provider:  provider,
@@ -161,6 +192,10 @@ func newDecodeLedgerPublisher(store *Store, provider DecodeLedgerProvider) *deco
 		published: make(map[string]struct{}),
 		wake:      make(chan struct{}, 1),
 		done:      make(chan struct{}),
+		lifetime:  lifetime,
+		cancel:    cancel,
+		stopStore: context.AfterFunc(store.runtimeContext(), cancel),
+		stopped:   make(chan struct{}),
 	}
 }
 
@@ -170,7 +205,9 @@ func (p *decodeLedgerPublisher) markDirty(podKey string) {
 		return
 	default:
 	}
-	p.mu.Lock()
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
 	p.dirty[podKey] = struct{}{}
 	p.mu.Unlock()
 	select {
@@ -182,19 +219,39 @@ func (p *decodeLedgerPublisher) markDirty(podKey string) {
 // close stops the publisher and, if its goroutine is running, waits for it to
 // return, so a flush in progress cannot land after a replacement's writes.
 func (p *decodeLedgerPublisher) close() {
-	p.closeOnce.Do(func() { close(p.done) })
-	if p.stopped != nil {
-		<-p.stopped
+	p.launchMu.Lock()
+	if !p.stopping {
+		p.stopping = true
+		p.cancel()
+		p.stopStore()
+		close(p.done)
+		if !p.launched {
+			close(p.stopped)
+		}
 	}
+	p.launchMu.Unlock()
+	<-p.stopped
 }
 
 // start runs the publisher's goroutine.
 func (p *decodeLedgerPublisher) start() {
-	p.stopped = make(chan struct{})
-	go func() {
+	p.launchMu.Lock()
+	defer p.launchMu.Unlock()
+	if p.stopping || p.launched {
+		return
+	}
+	p.launched = true
+	if !p.store.startOwnedTask(func() {
 		defer close(p.stopped)
 		p.run()
-	}()
+	}) {
+		p.launched = false
+		p.stopping = true
+		close(p.stopped)
+		p.cancel()
+		p.stopStore()
+		close(p.done)
+	}
 }
 
 func (p *decodeLedgerPublisher) run() {
@@ -204,12 +261,16 @@ func (p *decodeLedgerPublisher) run() {
 		select {
 		case <-p.wake:
 		case <-ticker.C:
-			p.mu.Lock()
+			if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+				return
+			}
 			for podKey := range p.published {
 				p.dirty[podKey] = struct{}{}
 			}
 			p.mu.Unlock()
 		case <-p.done:
+			return
+		case <-p.lifetime.Done():
 			return
 		}
 		p.flush()
@@ -219,7 +280,9 @@ func (p *decodeLedgerPublisher) run() {
 // flush writes the current ledger of every dirty pod in one pipeline. A pod
 // whose write fails stays dirty for the next flush.
 func (p *decodeLedgerPublisher) flush() {
-	p.mu.Lock()
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
 	if len(p.dirty) == 0 {
 		p.mu.Unlock()
 		return
@@ -231,7 +294,7 @@ func (p *decodeLedgerPublisher) flush() {
 	p.dirty = make(map[string]struct{})
 	p.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(p.lifetime, runningRequestsWriteTimeout)
 	defer cancel()
 	// Charge times are published on the Redis clock, so the sums from different
 	// gateways can be compared against one "now".
@@ -240,7 +303,12 @@ func (p *decodeLedgerPublisher) flush() {
 	pipe := p.store.redisClient.Pipeline()
 	zero := make(map[string]bool, len(batch))
 	for _, podKey := range batch {
-		state := p.provider(podKey)
+		state, err := p.provider(ctx, podKey)
+		if err != nil {
+			klog.V(4).ErrorS(err, "failed to read decode ledger", "pod", podKey)
+			p.requeue(batch)
+			return
+		}
 		key := decodeLedgerKey(podKey)
 		if state.isZero() {
 			zero[podKey] = true
@@ -253,14 +321,12 @@ func (p *decodeLedgerPublisher) flush() {
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		klog.V(4).ErrorS(err, "failed to publish decode ledger", "pod_count", len(batch))
-		p.mu.Lock()
-		for _, podKey := range batch {
-			p.dirty[podKey] = struct{}{}
-		}
-		p.mu.Unlock()
+		p.requeue(batch)
 		return
 	}
-	p.mu.Lock()
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
 	for _, podKey := range batch {
 		if zero[podKey] {
 			delete(p.published, podKey)
@@ -269,6 +335,16 @@ func (p *decodeLedgerPublisher) flush() {
 		}
 	}
 	p.mu.Unlock()
+}
+
+func (p *decodeLedgerPublisher) requeue(batch []string) {
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
+	defer p.mu.Unlock()
+	for _, podKey := range batch {
+		p.dirty[podKey] = struct{}{}
+	}
 }
 
 func formatLedgerFloat(v float64) string {
@@ -343,7 +419,7 @@ func (c *Store) readPodsSharedRoutingState(pods []*v1.Pod, withLedger bool) (map
 		return nil, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsReadTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsReadTimeout)
 	defer cancel()
 	pipe := c.redisClient.Pipeline()
 	liveCmd := pipe.ZRangeByScore(ctx, runningRequestsGatewaysKey, &redis.ZRangeBy{Min: c.liveGatewaysCutoffMillis(), Max: "+inf"})

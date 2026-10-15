@@ -52,15 +52,22 @@ type Manager struct {
 	enabled bool
 
 	// Lifecycle management
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.RWMutex
-	stopped bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.RWMutex
+	stopped  bool
+	stopOnce sync.Once
 }
 
 // NewManager creates a new KV event manager
 func NewManager(podProvider PodProvider, syncProvider SyncIndexProvider) *Manager {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewManagerWithContext(context.Background(), podProvider, syncProvider)
+}
+
+// NewManagerWithContext binds subscriptions and their I/O to lifetime. Start
+// performs setup; Stop cancels and awaits active callbacks and subscribers.
+func NewManagerWithContext(lifetime context.Context, podProvider PodProvider, syncProvider SyncIndexProvider) *Manager {
+	ctx, cancel := context.WithCancel(lifetime)
 
 	// Check configuration
 	enabled := validateConfiguration()
@@ -117,7 +124,7 @@ IndexerReadyLoop:
 			func() {
 				// Use 5s timeout for individual pod subscriptions as ZMQ
 				// connection establishment should be quick for healthy pods
-				subCtx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+				subCtx, cancel := context.WithTimeout(initCtx, 5*time.Second)
 				defer cancel() // Now properly scoped to this function
 
 				if err := m.subscribeToPod(subCtx, key, podInfo); err != nil {
@@ -138,66 +145,91 @@ IndexerReadyLoop:
 
 // Stop gracefully shuts down the manager
 func (m *Manager) Stop() {
-	m.mu.Lock()
-	if m.stopped {
-		m.mu.Unlock()
-		return
-	}
-	m.stopped = true
-	m.mu.Unlock()
-
-	klog.Info("Stopping KV event manager")
-
-	// Cancel context to signal shutdown
 	if m.cancel != nil {
 		m.cancel()
 	}
-
-	// Stop all subscribers
-	m.subscribers.Range(func(key string, client *kvcache.ZMQClient) bool {
-		client.Stop()
-		return true
+	m.stopOnce.Do(func() {
+		m.mu.Lock()
+		m.stopped = true
+		m.mu.Unlock()
+		m.subscribers.Range(func(key string, client *kvcache.ZMQClient) bool {
+			client.Stop()
+			return true
+		})
+		klog.Info("KV event manager stopped")
 	})
+}
 
-	klog.Info("KV event manager stopped")
+// podOperation keeps callbacks cancellable by both their caller and Stop.
+func (m *Manager) podOperation(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	stop := context.AfterFunc(m.ctx, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 // OnPodAdd handles new pod additions
 func (m *Manager) OnPodAdd(pod *v1.Pod) {
+	_ = m.OnPodAddContext(m.ctx, pod)
+}
+
+// OnPodAddContext subscribes after a cancellable lookup under parent and the
+// manager lifetime. It returns subscription/cancellation errors; a successful
+// subscription continues under the manager lifetime until Stop or removal.
+func (m *Manager) OnPodAddContext(parent context.Context, pod *v1.Pod) error {
+	parent, cancel := m.podOperation(parent)
+	defer cancel()
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	if !m.enabled || !isPodSubscribable(pod) {
-		return
+		return nil
 	}
 
 	// Check if manager is stopped before using its context
-	m.mu.RLock()
+	if err := utils.LockContext(parent, m.mu.TryRLock, m.mu.RUnlock); err != nil {
+		return err
+	}
 	stopped := m.stopped
-	m.mu.RUnlock()
+	defer m.mu.RUnlock()
 
 	if stopped {
-		return
+		return nil
 	}
 
 	// Use 5s timeout for pod operations as they involve simple ZMQ ops
-	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
-	defer cancel()
+	ctx := parent
 
 	// Get pod info
 	podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
 	podInfo, exists := m.podProvider.GetPod(ctx, podKey)
 	if !exists {
 		klog.Warningf("Pod %s not found in provider", podKey)
-		return
+		return ctx.Err()
 	}
 
 	if err := m.subscribeToPod(ctx, podKey, podInfo); err != nil {
 		klog.Errorf("Failed to subscribe to pod %s: %v", podKey, err)
+		return err
 	}
+	return parent.Err()
 }
 
 // OnPodUpdate handles pod updates
 func (m *Manager) OnPodUpdate(oldPod, newPod *v1.Pod) {
+	_ = m.OnPodUpdateContext(m.ctx, oldPod, newPod)
+}
+
+// OnPodUpdateContext updates subscriptions under parent and the manager
+// lifetime, returning cancellation or subscription errors. Existing matching
+// subscriptions remain active; Stop cancels and awaits their workers.
+func (m *Manager) OnPodUpdateContext(parent context.Context, oldPod, newPod *v1.Pod) error {
+	parent, cancel := m.podOperation(parent)
+	defer cancel()
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	if !m.enabled {
-		return
+		return nil
 	}
 
 	podKey := utils.GeneratePodKey(newPod.Namespace, newPod.Name)
@@ -213,38 +245,51 @@ func (m *Manager) OnPodUpdate(oldPod, newPod *v1.Pod) {
 			m.unsubscribeFromPod(podKey)
 		}
 		if newSubscribable {
-			m.OnPodAdd(newPod)
+			return m.OnPodAddContext(parent, newPod)
 		}
 	}
+	return parent.Err()
 }
 
 // OnPodDelete handles pod deletion
 func (m *Manager) OnPodDelete(pod *v1.Pod) {
+	_ = m.OnPodDeleteContext(m.ctx, pod)
+}
+
+// OnPodDeleteContext stops the pod subscriber and removes its indexed prefixes
+// under parent and the manager lifetime. It returns lookup/removal/cancellation
+// errors after any already-completed cleanup; callers may retry removal.
+func (m *Manager) OnPodDeleteContext(parent context.Context, pod *v1.Pod) error {
+	parent, cancel := m.podOperation(parent)
+	defer cancel()
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	if !m.enabled {
-		return
+		return nil
 	}
 
+	// Check if manager is stopped before using its context
+	if err := utils.LockContext(parent, m.mu.TryRLock, m.mu.RUnlock); err != nil {
+		return err
+	}
+	stopped := m.stopped
+	defer m.mu.RUnlock()
+
+	if stopped {
+		return nil
+	}
 	podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
 	m.unsubscribeFromPod(podKey)
 
-	// Check if manager is stopped before using its context
-	m.mu.RLock()
-	stopped := m.stopped
-	m.mu.RUnlock()
-
-	if stopped {
-		return
-	}
-
 	// Clean up from sync indexer
 	// Use 5s timeout for cleanup operations as they should be quick
-	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
-	defer cancel()
+	ctx := parent
 
 	syncIndexer, err := m.syncProvider.GetSyncIndexer(ctx)
 	if err != nil {
 		klog.Errorf("Failed to get sync indexer: %v", err)
-		return
+		return err
 	}
 
 	modelName, hasModelName := constants.ModelNameFromMetadata(pod.Labels, pod.Annotations)
@@ -258,8 +303,10 @@ func (m *Manager) OnPodDelete(pod *v1.Pod) {
 
 		if err := syncIndexer.RemovePrefix(ctx, modelName, loraID, podKey); err != nil {
 			klog.Errorf("Failed to remove prefix for pod %s: %v", podKey, err)
+			return err
 		}
 	}
+	return parent.Err()
 }
 
 // Internal methods
@@ -300,11 +347,16 @@ func (m *Manager) subscribeToPod(ctx context.Context, podKey string, podInfo *Po
 
 	// Create ZMQ client
 	config := kvcache.DefaultZMQClientConfig(podKey, podInfo.PodIP, podInfo.ModelName)
-	client := kvcache.NewZMQClient(config, handler)
+	client := kvcache.NewZMQClientWithContext(m.ctx, config, handler)
 
 	// Start subscription
-	if err := client.Start(); err != nil {
+	if err := client.StartWithContext(ctx); err != nil {
+		client.Stop()
 		return fmt.Errorf("failed to start ZMQ client: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		client.Stop()
+		return err
 	}
 
 	// Store subscriber

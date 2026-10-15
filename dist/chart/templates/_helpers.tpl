@@ -281,3 +281,12 @@ Return the Redis password Secret key name for a component.
 {{- fail (printf "aibrix.redis.connectionPasswordKey: unknown component %q" .component) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Match Kubernetes DNS label namespace validation, without normalization. */}}
+{{- define "aibrix.gatewayPlugin.installationNamespace" -}}
+{{- $namespace := required "gatewayPlugin.installationNamespace must name an existing workload namespace" .Values.gatewayPlugin.installationNamespace -}}
+{{- if or (gt (len $namespace) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) -}}
+{{- fail "gatewayPlugin.installationNamespace must be a valid Kubernetes namespace" -}}
+{{- end -}}
+{{- $namespace -}}
+{{- end -}}

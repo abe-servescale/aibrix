@@ -40,11 +40,11 @@ const (
 var ErrorNoAvailablePod = routeutil.ErrorNoAvailablePod
 
 func init() {
-	Register(RouterLeastBusyTime, least.NewLeastBusyTimeRouter)
-	Register(RouterLeastGpuCache, least.NewLeastKvCacheRouter)
-	Register(RouterLeastKvCache, least.NewLeastKvCacheRouter)
-	Register(RouterLeastLatency, least.NewLeastExpectedLatencyRouter)
-	Register(RouterLeastRequest, least.NewLeastRequestTopKRouter)
-	Register(RouterLeastRequestTopK, least.NewLeastRequestTopKRouter)
-	Register(RouterUtil, least.NewLeastUtilRouter)
+	registerLocal(RouterLeastBusyTime, least.NewLeastBusyTimeRouter)
+	registerLocal(RouterLeastGpuCache, least.NewLeastKvCacheRouter)
+	registerLocal(RouterLeastKvCache, least.NewLeastKvCacheRouter)
+	registerLocal(RouterLeastLatency, least.NewLeastExpectedLatencyRouter)
+	registerLocal(RouterLeastRequest, least.NewLeastRequestTopKRouter)
+	registerLocal(RouterLeastRequestTopK, least.NewLeastRequestTopKRouter)
+	registerLocal(RouterUtil, least.NewLeastUtilRouter)
 }

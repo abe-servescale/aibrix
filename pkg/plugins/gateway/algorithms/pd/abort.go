@@ -426,8 +426,7 @@ func OnPrefillLegFailed(client *http.Client, leg *types.PDLegState, requestID, m
 	// Taken before the goroutine starts, like everything else it needs: the
 	// leg is per-incarnation and stays valid, the routing context does not.
 	abortCtx := leg.AbortContext()
-	abortLaunched = true
-	go func() {
+	abortLaunched = leg.StartBackground(func(context.Context) {
 		// The goroutine owns the rest of the lifecycle: releasing the abort
 		// context and making AbortDone() ready.
 		defer leg.FinishDecodeAbort()
@@ -480,7 +479,7 @@ func OnPrefillLegFailed(client *http.Client, leg *types.PDLegState, requestID, m
 		case <-retryTimer.C:
 		}
 		attemptAbort(2)
-	}()
+	})
 
 	return failure
 }

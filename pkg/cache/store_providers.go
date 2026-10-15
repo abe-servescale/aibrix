@@ -88,15 +88,15 @@ func (a *storeProviderAdapter) GetPod(ctx context.Context, podKey string) (*kvev
 		return nil, false
 	}
 
-	modelName, _ := constants.ModelNameFromMetadata(metaPod.Pod.Labels, metaPod.Pod.Annotations)
+	modelName, _ := constants.ModelNameFromMetadata(metaPod.Labels, metaPod.Annotations)
 
 	// Create lightweight copy
 	return &kvevent.PodInfo{
-		Name:      metaPod.Pod.Name,
-		Namespace: metaPod.Pod.Namespace,
-		PodIP:     metaPod.Pod.Status.PodIP,
+		Name:      metaPod.Name,
+		Namespace: metaPod.Namespace,
+		PodIP:     metaPod.Status.PodIP,
 		ModelName: modelName,
-		Labels:    metaPod.Pod.Labels, // Shallow copy - labels are read-only
+		Labels:    metaPod.Labels, // Shallow copy - labels are read-only
 		Models:    metaPod.Models.Array(),
 	}, true
 }
@@ -114,15 +114,15 @@ func (a *storeProviderAdapter) RangePods(ctx context.Context, f func(key string,
 		default:
 		}
 
-		modelName, _ := constants.ModelNameFromMetadata(metaPod.Pod.Labels, metaPod.Pod.Annotations)
+		modelName, _ := constants.ModelNameFromMetadata(metaPod.Labels, metaPod.Annotations)
 
 		// Create lightweight copy
 		podInfo := &kvevent.PodInfo{
-			Name:      metaPod.Pod.Name,
-			Namespace: metaPod.Pod.Namespace,
-			PodIP:     metaPod.Pod.Status.PodIP,
+			Name:      metaPod.Name,
+			Namespace: metaPod.Namespace,
+			PodIP:     metaPod.Status.PodIP,
 			ModelName: modelName,
-			Labels:    metaPod.Pod.Labels,
+			Labels:    metaPod.Labels,
 			Models:    metaPod.Models.Array(),
 		}
 
@@ -185,7 +185,7 @@ func (a *syncIndexerAdapter) ProcessBlockStored(ctx context.Context, event kveve
 		GroupIdx:        event.GroupIdx,
 	}
 
-	return a.indexer.ProcessBlockStored(syncEvent)
+	return a.indexer.ProcessBlockStoredContext(ctx, syncEvent)
 }
 
 // ProcessBlockRemoved implements kvevent.SyncIndexer interface
@@ -200,10 +200,10 @@ func (a *syncIndexerAdapter) ProcessBlockRemoved(ctx context.Context, event kvev
 		GroupIdx:    event.GroupIdx,
 	}
 
-	return a.indexer.ProcessBlockRemoved(syncEvent)
+	return a.indexer.ProcessBlockRemovedContext(ctx, syncEvent)
 }
 
 // RemovePrefix implements kvevent.SyncIndexer interface
 func (a *syncIndexerAdapter) RemovePrefix(ctx context.Context, modelName string, loraID int64, podKey string) error {
-	return a.indexer.RemovePrefix(modelName, loraID, podKey)
+	return a.indexer.RemovePrefixContext(ctx, modelName, loraID, podKey)
 }

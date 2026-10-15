@@ -34,7 +34,7 @@ type KVEventManager struct {
 func NewKVEventManager(store *Store) *KVEventManager {
 	// Create adapter to implement provider interfaces
 	podProvider, syncProvider := NewStoreProviderAdapter(store)
-	manager := kvevent.NewManager(podProvider, syncProvider)
+	manager := kvevent.NewManagerWithContext(store.runtimeContext(), podProvider, syncProvider)
 	return &KVEventManager{Manager: manager}
 }
 

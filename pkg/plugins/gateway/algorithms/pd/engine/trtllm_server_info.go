@@ -77,9 +77,17 @@ type TRTServerInfoCache struct {
 	entries map[string]trtServerInfoEntry
 	loads   singleflight.Group
 	now     func() time.Time
+	owner   *utils.OwnedTasks
 }
 
 func NewTRTServerInfoCache(client *http.Client) *TRTServerInfoCache {
+	return NewTRTServerInfoCacheWithOwner(client, nil)
+}
+
+// NewTRTServerInfoCacheWithOwner assigns detached shared lookups to owner.
+// Lookups outlive client cancellation but owner.Close cancels and awaits them.
+// A nil owner preserves the legacy bounded singleflight behavior.
+func NewTRTServerInfoCacheWithOwner(client *http.Client, owner *utils.OwnedTasks) *TRTServerInfoCache {
 	// Reuse the transport, but never follow a worker's redirect to a different
 	// endpoint. server_info must describe the worker we actually selected.
 	if client == nil {
@@ -91,10 +99,16 @@ func NewTRTServerInfoCache(client *http.Client) *TRTServerInfoCache {
 		client:  &copyClient,
 		entries: make(map[string]trtServerInfoEntry),
 		now:     time.Now,
+		owner:   owner,
 	}
 }
 
 func (c *TRTServerInfoCache) Get(ctx context.Context, pod *v1.Pod) (TRTServerInfo, error) {
+	if c.owner != nil {
+		ctx = utils.WithTaskOwner(ctx, c.owner)
+	}
+	ctx, release := utils.ContextWithOwnerLifetime(ctx)
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return TRTServerInfo{}, err
 	}
@@ -114,23 +128,44 @@ func (c *TRTServerInfoCache) Get(ctx context.Context, pod *v1.Pod) (TRTServerInf
 	for _, status := range pod.Status.ContainerStatuses {
 		fmt.Fprintf(&key, "/%s:%d", status.Name, status.RestartCount)
 	}
-	if info, ok := c.lookup(key.String()); ok {
+	if info, ok, err := c.lookup(ctx, key.String()); err != nil {
+		return TRTServerInfo{}, err
+	} else if ok {
 		return info, nil
 	}
-	result := c.loads.DoChan(key.String(), func() (any, error) {
-		if info, ok := c.lookup(key.String()); ok {
+	load := func() (any, error) {
+		// Detach only the shared metadata lookup, never the inference request.
+		parent, release := utils.ContextWithOwnerLifetime(context.WithoutCancel(ctx))
+		defer release()
+		fetchCtx, cancel := context.WithTimeout(parent, trtServerInfoTimeout)
+		defer cancel()
+		if info, ok, err := c.lookup(fetchCtx, key.String()); err != nil {
+			return TRTServerInfo{}, err
+		} else if ok {
 			return info, nil
 		}
-		// Detach only the shared metadata lookup, never the inference request.
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), trtServerInfoTimeout)
-		defer cancel()
 		info, err := c.fetch(fetchCtx, "http://"+addr+"/server_info")
 		if err != nil {
 			return TRTServerInfo{}, err
 		}
-		c.store(key.String(), info)
+		if err := c.store(fetchCtx, key.String(), info); err != nil {
+			return TRTServerInfo{}, err
+		}
 		return info, nil
-	})
+	}
+	var result <-chan singleflight.Result
+	if c.owner == nil {
+		result = c.loads.DoChan(key.String(), load)
+	} else {
+		completed := make(chan singleflight.Result, 1)
+		if !c.owner.Start(func() {
+			value, err, _ := c.loads.Do(key.String(), load)
+			completed <- singleflight.Result{Val: value, Err: err}
+		}) {
+			return TRTServerInfo{}, context.Canceled
+		}
+		result = completed
+	}
 	select {
 	case <-ctx.Done():
 		return TRTServerInfo{}, ctx.Err()
@@ -142,21 +177,26 @@ func (c *TRTServerInfoCache) Get(ctx context.Context, pod *v1.Pod) (TRTServerInf
 	}
 }
 
-func (c *TRTServerInfoCache) lookup(key string) (TRTServerInfo, bool) {
-	c.mu.Lock()
+func (c *TRTServerInfoCache) lookup(ctx context.Context, key string) (TRTServerInfo, bool, error) {
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return TRTServerInfo{}, false, err
+	}
 	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if ok && c.now().Before(entry.expires) {
-		return entry.info, true
+		return entry.info, true, nil
 	}
 	delete(c.entries, key)
-	return TRTServerInfo{}, false
+	return TRTServerInfo{}, false, nil
 }
 
-func (c *TRTServerInfoCache) store(key string, info TRTServerInfo) {
-	c.mu.Lock()
+func (c *TRTServerInfoCache) store(ctx context.Context, key string, info TRTServerInfo) error {
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 	c.entries[key] = trtServerInfoEntry{info: info, expires: c.now().Add(trtServerInfoTTL)}
+	return nil
 }
 
 func (c *TRTServerInfoCache) fetch(ctx context.Context, url string) (TRTServerInfo, error) {

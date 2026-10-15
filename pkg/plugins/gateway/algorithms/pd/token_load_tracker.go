@@ -17,6 +17,7 @@ limitations under the License.
 package pd
 
 import (
+	"context"
 	"math"
 	"os"
 	"strconv"
@@ -196,6 +197,11 @@ type TokenLoadTracker struct {
 	stopCh      chan struct{}
 	janitorDone chan struct{}
 	closeOnce   sync.Once
+	lifetime    context.Context
+	cancel      context.CancelFunc
+	// updates follows the owner's lifetime for managed accounting, while
+	// legacy trackers retain usable accounting after their janitor closes.
+	updates context.Context
 	// clock is injectable so unit tests can age entries without sleeping.
 	clock func() time.Time
 	// epoch is the origin of the charge times summed in decodeInflight. Keeping
@@ -284,7 +290,18 @@ func NewTokenLoadTracker() *TokenLoadTracker {
 // NewTokenLoadTrackerWithConfig creates a tracker with an explicit config and
 // starts its TTL janitor when cfg.TTL or cfg.SessionTTL is positive.
 func NewTokenLoadTrackerWithConfig(cfg TokenLoadConfig) *TokenLoadTracker {
+	return NewTokenLoadTrackerWithContext(context.Background(), cfg)
+}
+
+// NewTokenLoadTrackerWithContext owns its TTL janitor under lifetime. Close
+// stops and awaits the janitor; charges remain readable after cancellation.
+// Accounting waits also honor lifetime; interrupted updates leave their
+// release flags unchanged. Legacy constructors retain uncanceled accounting.
+func NewTokenLoadTrackerWithContext(lifetime context.Context, cfg TokenLoadConfig) *TokenLoadTracker {
 	t := newTokenLoadTracker(cfg, time.Now)
+	t.cancel()
+	t.lifetime, t.cancel = context.WithCancel(lifetime)
+	t.updates = lifetime
 	janitor := cfg.TTL > 0 || cfg.SessionTTL > 0
 	if janitor {
 		t.startJanitor(tokenLoadJanitorInterval)
@@ -302,7 +319,8 @@ func newTokenLoadTracker(cfg TokenLoadConfig, clock func() time.Time) *TokenLoad
 	if cfg.MaxSessions <= 0 {
 		cfg.MaxSessions = DefaultTokenLoadMaxSessions
 	}
-	t := &TokenLoadTracker{cfg: cfg, clock: clock, stopCh: make(chan struct{})}
+	lifetime, cancel := context.WithCancel(context.Background())
+	t := &TokenLoadTracker{cfg: cfg, clock: clock, stopCh: make(chan struct{}), lifetime: lifetime, cancel: cancel, updates: context.Background()}
 	t.epoch = t.now()
 	return t
 }
@@ -310,7 +328,7 @@ func newTokenLoadTracker(cfg TokenLoadConfig, clock func() time.Time) *TokenLoad
 // Close stops the janitor goroutine, if one was started, and returns once it
 // has exited. Charges and counters stay readable. Safe to call more than once.
 func (t *TokenLoadTracker) Close() {
-	t.closeOnce.Do(func() { close(t.stopCh) })
+	t.closeOnce.Do(func() { t.cancel(); close(t.stopCh) })
 	if t.janitorDone != nil {
 		<-t.janitorDone
 	}
@@ -424,7 +442,9 @@ func (t *TokenLoadTracker) recordSessionPrompt(model, sessionID string, promptTo
 			return 0, false
 		}
 		sess := v.(*tokenLoadSession)
-		sess.mu.Lock()
+		if err := utils.LockContext(t.updates, sess.mu.TryLock, sess.mu.Unlock); err != nil {
+			return 0, false
+		}
 		if sess.deleted {
 			sess.mu.Unlock() // swept between Load and Lock; start over
 			continue
@@ -494,22 +514,40 @@ func (t *TokenLoadTracker) ReleaseKVCache(requestID string) {
 
 // releaseTokens releases the active part of entry, once.
 func (t *TokenLoadTracker) releaseTokens(requestID string, entry *tokenLoadEntry) {
-	if !entry.tokensReleased.CompareAndSwap(false, true) {
-		return
+	t.releaseTokensContext(t.updates, requestID, entry)
+}
+
+func (t *TokenLoadTracker) releaseTokensContext(ctx context.Context, requestID string, entry *tokenLoadEntry) bool {
+	if err := utils.LockContext(ctx, t.countersMu.TryRLock, t.countersMu.RUnlock); err != nil {
+		return false
 	}
-	t.addActive(entry.podKey, -entry.cost)
+	defer t.countersMu.RUnlock()
+	if !entry.tokensReleased.CompareAndSwap(false, true) {
+		return true
+	}
+	t.updateCounter(&t.activeTokens, metrics.PDTokenLoadActiveTokens, entry.podKey, -entry.cost)
 	klog.V(4).InfoS("token_load_tokens_released", "request_id", requestID, "pod", entry.podKey, "cost", entry.cost)
 	t.forgetIfReleased(requestID, entry)
+	return true
 }
 
 // releaseKV releases the resident-KV part of entry, once.
 func (t *TokenLoadTracker) releaseKV(requestID string, entry *tokenLoadEntry) {
-	if !entry.kvReleased.CompareAndSwap(false, true) {
-		return
+	t.releaseKVContext(t.updates, requestID, entry)
+}
+
+func (t *TokenLoadTracker) releaseKVContext(ctx context.Context, requestID string, entry *tokenLoadEntry) bool {
+	if err := utils.LockContext(ctx, t.countersMu.TryRLock, t.countersMu.RUnlock); err != nil {
+		return false
 	}
-	t.addKV(entry.podKey, -entry.cost)
+	defer t.countersMu.RUnlock()
+	if !entry.kvReleased.CompareAndSwap(false, true) {
+		return true
+	}
+	t.updateCounter(&t.kvTokens, metrics.PDTokenLoadKVTokens, entry.podKey, -entry.cost)
 	klog.V(4).InfoS("token_load_kv_released", "request_id", requestID, "pod", entry.podKey, "cost", entry.cost)
 	t.forgetIfReleased(requestID, entry)
+	return true
 }
 
 // forgetIfReleased drops entry from the ledger once both of its parts are
@@ -564,14 +602,31 @@ func (t *TokenLoadTracker) ReleaseDecode(requestID string) {
 // is keyed on the entry pointer, so it never removes a newer charge that
 // replaced this one under the same request ID.
 func (t *TokenLoadTracker) releaseDecode(requestID string, entry *decodeLoadEntry) {
-	if !entry.released.CompareAndSwap(false, true) {
-		return
+	t.releaseDecodeContext(t.updates, requestID, entry)
+}
+
+func (t *TokenLoadTracker) releaseDecodeContext(ctx context.Context, requestID string, entry *decodeLoadEntry) bool {
+	if err := utils.LockContext(ctx, t.countersMu.TryRLock, t.countersMu.RUnlock); err != nil {
+		return false
 	}
-	t.addDecode(entry.podKey, -entry.cost)
-	t.addDecodeInflight(entry.podKey, -1, entry.acquiredAt, entry.cost)
+	agg := t.loadDecodeInflight(entry.podKey)
+	if err := utils.LockContext(ctx, agg.mu.TryLock, agg.mu.Unlock); err != nil {
+		t.countersMu.RUnlock()
+		return false
+	}
+	if !entry.released.CompareAndSwap(false, true) {
+		agg.mu.Unlock()
+		t.countersMu.RUnlock()
+		return true
+	}
+	t.updateCounter(&t.decodeTokens, metrics.PDTokenLoadDecodeTokens, entry.podKey, -entry.cost)
+	t.updateDecodeInflight(agg, -1, entry.acquiredAt, entry.cost)
 	t.decodeEntries.CompareAndDelete(requestID, entry)
+	agg.mu.Unlock()
+	t.countersMu.RUnlock()
 	t.notifyDecode(entry.podKey)
 	klog.V(4).InfoS("token_load_decode_released", "request_id", requestID, "pod", entry.podKey, "cost", entry.cost)
+	return true
 }
 
 // GetDecodeLoad returns the decode counter of the pod identified by podKey:
@@ -608,7 +663,9 @@ func (t *TokenLoadTracker) DecodeGrowth(podKey string, ratePerRequest float64) f
 		return 0
 	}
 	agg := v.(*decodeInflight)
-	agg.mu.Lock()
+	if err := utils.LockContext(t.updates, agg.mu.TryLock, agg.mu.Unlock); err != nil {
+		return 0
+	}
 	n, sumAt := agg.n, agg.sumAt
 	agg.mu.Unlock()
 	elapsed := float64(n)*t.sinceEpoch(t.now()) - sumAt
@@ -628,19 +685,32 @@ func (t *TokenLoadTracker) sinceEpoch(ts time.Time) float64 {
 // replica's ledger, growth included, to its own. The three values are read
 // together, so a charge or release in progress is either fully in them or not.
 func (t *TokenLoadTracker) DecodeLedgerState(podKey string) (tokens float64, charges int64, sumChargedAt float64) {
+	tokens, charges, sumChargedAt, _ = t.DecodeLedgerStateContext(context.Background(), podKey)
+	return
+}
+
+// DecodeLedgerStateContext reads the same ledger as DecodeLedgerState with a
+// cancellable aggregate-lock wait. Cancellation returns zero values and ctx's
+// error; it does not change charges. No background work is started.
+func (t *TokenLoadTracker) DecodeLedgerStateContext(ctx context.Context, podKey string) (tokens float64, charges int64, sumChargedAt float64, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, err
+	}
 	v, ok := t.decodeInflight.Load(podKey)
 	if !ok {
-		return 0, 0, 0
+		return 0, 0, 0, nil
 	}
 	agg := v.(*decodeInflight)
-	agg.mu.Lock()
+	if err := utils.LockContext(ctx, agg.mu.TryLock, agg.mu.Unlock); err != nil {
+		return 0, 0, 0, err
+	}
 	n, sumAt, tokens := agg.n, agg.sumAt, agg.tokens
 	agg.mu.Unlock()
 	if n <= 0 {
-		return 0, 0, 0
+		return 0, 0, 0, nil
 	}
 	epoch := float64(t.epoch.Unix()) + float64(t.epoch.Nanosecond())/1e9
-	return tokens, n, sumAt + float64(n)*epoch
+	return tokens, n, sumAt + float64(n)*epoch, nil
 }
 
 // SetDecodeLedgerListener registers fn to be called with a pod key after every
@@ -665,15 +735,29 @@ func (t *TokenLoadTracker) notifyDecode(podKey string) {
 // Like the counters, it runs under the shared lock so the janitor cannot prune
 // the aggregate in between.
 func (t *TokenLoadTracker) addDecodeInflight(podKey string, delta int64, at time.Time, cost float64) {
-	t.countersMu.RLock()
+	if err := utils.LockContext(t.updates, t.countersMu.TryRLock, t.countersMu.RUnlock); err != nil {
+		return
+	}
 	defer t.countersMu.RUnlock()
+	agg := t.loadDecodeInflight(podKey)
+	if err := utils.LockContext(t.updates, agg.mu.TryLock, agg.mu.Unlock); err != nil {
+		return
+	}
+	defer agg.mu.Unlock()
+	t.updateDecodeInflight(agg, delta, at, cost)
+}
+
+// loadDecodeInflight requires countersMu so pruning cannot remove the result.
+func (t *TokenLoadTracker) loadDecodeInflight(podKey string) *decodeInflight {
 	v, ok := t.decodeInflight.Load(podKey)
 	if !ok {
 		v, _ = t.decodeInflight.LoadOrStore(podKey, &decodeInflight{})
 	}
-	agg := v.(*decodeInflight)
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
+	return v.(*decodeInflight)
+}
+
+// updateDecodeInflight requires countersMu and agg.mu.
+func (t *TokenLoadTracker) updateDecodeInflight(agg *decodeInflight, delta int64, at time.Time, cost float64) {
 	agg.n += delta
 	agg.sumAt += float64(delta) * t.sinceEpoch(at)
 	agg.tokens += float64(delta) * cost
@@ -727,8 +811,16 @@ func (t *TokenLoadTracker) addDecode(podKey string, delta float64) {
 // gauge metricName. The shared lock only excludes the janitor's pruning;
 // writers still run concurrently with each other.
 func (t *TokenLoadTracker) addCounter(m *sync.Map, metricName, podKey string, delta float64) {
-	t.countersMu.RLock()
+	if err := utils.LockContext(t.updates, t.countersMu.TryRLock, t.countersMu.RUnlock); err != nil {
+		return
+	}
 	defer t.countersMu.RUnlock()
+	t.updateCounter(m, metricName, podKey, delta)
+}
+
+// updateCounter requires countersMu; separate locked mutation avoids nested
+// read locks when a writer is waiting during a release.
+func (t *TokenLoadTracker) updateCounter(m *sync.Map, metricName, podKey string, delta float64) {
 	value := addFloat(m, podKey, delta)
 	metrics.SetGaugeMetric(metricName, metrics.GetMetricHelp(metricName), value, tokenLoadGaugeLabels, tokenLoadGaugeLabelValues(podKey)...)
 }
@@ -747,6 +839,8 @@ func (t *TokenLoadTracker) startJanitor(interval time.Duration) {
 				t.sweepExpired()
 				t.pruneIdle()
 			case <-t.stopCh:
+				return
+			case <-t.lifetime.Done():
 				return
 			}
 		}
@@ -767,7 +861,9 @@ func (t *TokenLoadTracker) sweepExpired() int {
 			// the session lock, so a concurrent refresh either lands before
 			// the check and keeps the session, or sees the tombstone and
 			// re-inserts; it can never be lost.
-			sess.mu.Lock()
+			if err := utils.LockContext(t.lifetime, sess.mu.TryLock, sess.mu.Unlock); err != nil {
+				return false
+			}
 			if now.Sub(sess.lastSeen) > t.cfg.SessionTTL {
 				sess.deleted = true
 				t.sessions.Delete(key)
@@ -779,6 +875,9 @@ func (t *TokenLoadTracker) sweepExpired() int {
 	}
 	released := 0
 	t.entries.Range(func(key, val any) bool {
+		if t.lifetime.Err() != nil {
+			return false
+		}
 		entry := val.(*tokenLoadEntry)
 		// The TTL is per entry: a request whose profile sets ttlSeconds ages
 		// out on its own schedule, and 0 means this charge is never swept.
@@ -795,12 +894,16 @@ func (t *TokenLoadTracker) sweepExpired() int {
 		// Release this entry, not whatever is under requestID now: the flags
 		// make a concurrent normal release harmless, and a re-acquire that
 		// replaced the entry in the meantime must keep its own charge.
-		t.releaseTokens(requestID, entry)
-		t.releaseKV(requestID, entry)
+		if !t.releaseTokensContext(t.lifetime, requestID, entry) || !t.releaseKVContext(t.lifetime, requestID, entry) {
+			return false
+		}
 		released++
 		return true
 	})
 	t.decodeEntries.Range(func(key, val any) bool {
+		if t.lifetime.Err() != nil {
+			return false
+		}
 		entry := val.(*decodeLoadEntry)
 		if entry.ttl <= 0 {
 			return true
@@ -812,7 +915,9 @@ func (t *TokenLoadTracker) sweepExpired() int {
 		requestID := key.(string)
 		klog.Warningf("token_load_tracker force-releasing stale decode charge: request_id=%s pod=%s cost=%g age_seconds=%.0f ttl_seconds=%.0f",
 			requestID, entry.podKey, entry.cost, age.Seconds(), entry.ttl.Seconds())
-		t.releaseDecode(requestID, entry)
+		if !t.releaseDecodeContext(t.lifetime, requestID, entry) {
+			return false
+		}
 		released++
 		return true
 	})
@@ -826,7 +931,9 @@ func (t *TokenLoadTracker) sweepExpired() int {
 // its counters and gauge series on the gateway forever. A pruned pod is
 // re-created, from zero, by its next charge.
 func (t *TokenLoadTracker) pruneIdle() int {
-	t.countersMu.Lock()
+	if err := utils.LockContext(t.lifetime, t.countersMu.TryLock, t.countersMu.Unlock); err != nil {
+		return 0
+	}
 	defer t.countersMu.Unlock()
 
 	pods := map[string]struct{}{}
@@ -840,6 +947,9 @@ func (t *TokenLoadTracker) pruneIdle() int {
 
 	pruned := 0
 	for pod := range pods {
+		if t.lifetime.Err() != nil {
+			return pruned
+		}
 		// Clear both flags before deciding, so a pod that is active on one
 		// counter is re-examined from scratch next time.
 		active := idleCounter(&t.activeTokens, pod)
@@ -870,7 +980,9 @@ func (t *TokenLoadTracker) pruneDecodeInflight(pod string) {
 		return
 	}
 	agg := v.(*decodeInflight)
-	agg.mu.Lock()
+	if err := utils.LockContext(t.lifetime, agg.mu.TryLock, agg.mu.Unlock); err != nil {
+		return
+	}
 	defer agg.mu.Unlock()
 	if agg.n == 0 {
 		t.decodeInflight.Delete(pod)

@@ -1,0 +1,71 @@
+# Run at the outermost Kustomization, after its namespace and patches.
+apiVersion: builtin
+kind: ReplacementTransformer
+metadata:
+  name: gateway-discovery-namespace
+replacements:
+- source:
+    kind: ConfigMap
+    name: gateway-discovery-config
+    fieldPath: data.installationNamespace
+  targets:
+  - select:
+      kind: Deployment
+      name: gateway-plugins
+    fieldPaths:
+    # The namespace flag is the first argument in Kubernetes gateway manifests.
+    - spec.template.spec.containers.[name=gateway-plugin].args.0
+    options:
+      delimiter: '='
+      index: 1
+  - select:
+      kind: Role
+      name: gateway-plugins-role|gateway-pod-wake
+    fieldPaths:
+    - metadata.namespace
+  - select:
+      kind: RoleBinding
+      name: gateway-plugins-rolebinding|gateway-pod-wake
+    fieldPaths:
+    - metadata.namespace
+  - select:
+      kind: ClusterRole
+      name: gateway-installation-namespace
+    fieldPaths:
+    # This role has exactly one Namespace GET rule and one resource name.
+    - rules.0.resourceNames.0
+- source:
+    kind: Deployment
+    name: gateway-plugins
+    fieldPath: metadata.namespace
+  targets:
+  - select:
+      kind: RoleBinding
+      labelSelector: app.kubernetes.io/component=aibrix-gateway-plugins
+    fieldPaths:
+    - subjects.[kind=ServiceAccount].namespace
+  - select:
+      kind: ClusterRoleBinding
+      labelSelector: app.kubernetes.io/component=aibrix-gateway-plugins
+    fieldPaths:
+    - subjects.[kind=ServiceAccount].namespace
+- source:
+    kind: ServiceAccount
+    name: gateway-plugins
+    fieldPath: metadata.name
+  targets:
+  - select:
+      kind: Deployment
+      name: gateway-plugins
+    fieldPaths:
+    - spec.template.spec.serviceAccountName
+  - select:
+      kind: RoleBinding
+      labelSelector: app.kubernetes.io/component=aibrix-gateway-plugins
+    fieldPaths:
+    - subjects.[kind=ServiceAccount].name
+  - select:
+      kind: ClusterRoleBinding
+      labelSelector: app.kubernetes.io/component=aibrix-gateway-plugins
+    fieldPaths:
+    - subjects.[kind=ServiceAccount].name

@@ -97,12 +97,21 @@ func TestPodsOnlyFlagsStartDiscoveryWithoutCRDAccess(t *testing.T) {
 	fs := flag.NewFlagSet(t.Name(), flag.ContinueOnError)
 	options.addFlags(fs)
 	require.NoError(t, fs.Parse([]string{
-		"--watch-model-adapters=false", "--watch-model-claims=false", "--model-list-mode=ready-pods",
+		"--installation-namespace=default", "--watch-model-adapters=false",
+		"--watch-model-claims=false", "--model-list-mode=ready-pods",
 	}))
 	require.NoError(t, options.validate())
 
 	var crdRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/namespaces/default" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(&v1.Namespace{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"},
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+			})
+			return
+		}
 		if !strings.HasSuffix(r.URL.Path, "/pods") {
 			crdRequests.Add(1)
 			http.Error(w, "custom resources are unavailable", http.StatusForbidden)
@@ -128,8 +137,10 @@ func TestPodsOnlyFlagsStartDiscoveryWithoutCRDAccess(t *testing.T) {
 	})
 
 	result := make(chan error, 1)
+	provider, err := options.kubernetesProvider(&rest.Config{Host: server.URL})
+	require.NoError(t, err)
 	go func() {
-		result <- options.kubernetesProvider(&rest.Config{Host: server.URL}).Watch(func(discovery.WatchEvent) {}, stopCh)
+		result <- provider.Watch(func(discovery.WatchEvent) {}, stopCh)
 	}()
 	select {
 	case err := <-result:

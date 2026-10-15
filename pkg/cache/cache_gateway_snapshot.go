@@ -59,15 +59,16 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 	if store.redisClient == nil {
 		return
 	}
-	ticker := time.NewTicker(gatewaySnapshotSyncInterval)
-	go func() {
+	store.startOwnedTask(func() {
+		ticker := time.NewTicker(gatewaySnapshotSyncInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				// Bounded context per tick so a stuck Redis client cannot block this goroutine
 				// indefinitely. Use a closure so defer cancel runs each iteration, not once at exit.
 				func() {
-					ctx, cancel := context.WithTimeout(context.Background(), gatewaySnapshotSyncInterval)
+					ctx, cancel := context.WithTimeout(store.runtimeContext(), gatewaySnapshotSyncInterval)
 					defer cancel()
 					start := time.Now()
 
@@ -135,7 +136,7 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // UpsertGatewayPodSnapshot writes this gateway instance's snapshot for a single pod to Redis.

@@ -31,7 +31,13 @@ type ZMQClient struct {
 
 // NewZMQClient creates a stub ZMQ client
 func NewZMQClient(config *ZMQClientConfig, handler EventHandler) *ZMQClient {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewZMQClientWithContext(context.Background(), config, handler)
+}
+
+// NewZMQClientWithContext derives a cancellable lifecycle in builds without
+// ZMQ. It starts no worker; Stop is safe and releases its context.
+func NewZMQClientWithContext(lifetime context.Context, config *ZMQClientConfig, handler EventHandler) *ZMQClient {
+	ctx, cancel := context.WithCancel(lifetime)
 	return &ZMQClient{
 		config: config,
 		ctx:    ctx,
@@ -85,4 +91,13 @@ func (c *ZMQClient) Reconnect() error {
 // WaitForConnection returns an error
 func (c *ZMQClient) WaitForConnection(timeout time.Duration) error {
 	return fmt.Errorf("ZMQ support not compiled in (build with -tags=zmq)")
+}
+
+// StartWithContext returns ctx's cancellation error first, otherwise the
+// unsupported-ZMQ error. It starts no continuing work in this build.
+func (c *ZMQClient) StartWithContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.Start()
 }

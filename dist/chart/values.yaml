@@ -48,6 +48,8 @@ controllerManager:
   affinity: {}
 
 gatewayPlugin:
+  # Required workload namespace for model discovery, independent of the release namespace.
+  installationNamespace: default
   replicaCount: 1
   imagePullSecrets: []
   initContainer:

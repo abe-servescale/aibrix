@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vllm-project/aibrix/pkg/utils"
+
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -154,13 +156,14 @@ type PDLegState struct {
 	// may have been recycled.
 	pdOverrides atomic.Pointer[PDOverrides]
 
-	// abortMu guards the two fields below. The abort context is built by the
+	// abortMu guards the captured contexts below. The abort context is built by the
 	// goroutine that sends the abort and cancelled by the goroutine that owns
 	// the client stream, so the two race; both critical sections are a single
 	// field access.
 	abortMu     sync.Mutex
 	abortCtx    context.Context
 	abortCancel context.CancelFunc
+	taskContext context.Context
 
 	// abortDone is closed once the decode abort of this incarnation is over:
 	// either the goroutine that sends it has exited, or the failure path
@@ -193,6 +196,35 @@ func newPDLegState() *PDLegState {
 		prefillSucceeded: make(chan struct{}),
 		abortDone:        make(chan struct{}),
 	}
+}
+
+// SetTaskContext captures request values and gateway task ownership once,
+// before dispatch. Client cancellation is detached; gateway cancellation stays
+// active for background prefill/abort work. The pooled routing object is not kept.
+func (l *PDLegState) SetTaskContext(ctx context.Context) {
+	if l == nil {
+		return
+	}
+	l.abortMu.Lock()
+	defer l.abortMu.Unlock()
+	if l.taskContext == nil {
+		l.taskContext = context.WithoutCancel(ctx)
+	}
+}
+
+// StartBackground starts an abort task under the captured gateway owner.
+// False means shutdown rejected it; the caller must finish its abort state.
+// Legs without a gateway owner preserve the legacy detached task behavior.
+func (l *PDLegState) StartBackground(task func(context.Context)) bool {
+	parent := context.Background()
+	if l != nil {
+		l.abortMu.Lock()
+		if l.taskContext != nil {
+			parent = l.taskContext
+		}
+		l.abortMu.Unlock()
+	}
+	return utils.GoWithOwner(parent, task)
 }
 
 // SetRID records the engine-visible rid. Only the first call has any effect in
@@ -236,11 +268,9 @@ func (l *PDLegState) MarkDecodeResponded() {
 // AbortContext returns the context that bounds the best-effort abort of this
 // request's decode leg.
 //
-// It is rooted at context.Background(), not at the request context: by the
-// time a prefill failure surfaces, the request context is usually cancelled
-// already and the abort is precisely the work that has to outlive it. It is
-// cancellable all the same, because the abort has a stop condition of its own
-// - see MarkDecodeResponded.
+// It outlives client cancellation but stops with captured gateway ownership
+// and when the decode leg begins answering (see MarkDecodeResponded).
+// Legacy legs without an owner retain their Background-based lifetime.
 //
 // The context is built on first use, so the overwhelming majority of requests,
 // which never abort anything, do not pay for one.
@@ -251,7 +281,11 @@ func (l *PDLegState) AbortContext() context.Context {
 	l.abortMu.Lock()
 	defer l.abortMu.Unlock()
 	if l.abortCtx == nil {
-		l.abortCtx, l.abortCancel = context.WithCancel(context.Background())
+		parent := l.taskContext
+		if parent == nil {
+			parent = context.Background()
+		}
+		l.abortCtx, l.abortCancel = utils.ContextWithOwnerLifetime(parent)
 		if l.decodeResponded.Load() {
 			// The decode leg started answering before there was anything to
 			// cancel; the abort must still come back a cancelled one.

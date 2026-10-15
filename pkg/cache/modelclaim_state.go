@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"sort"
 	"sync"
 
@@ -54,7 +55,13 @@ type modelClaimState struct {
 }
 
 func (s *modelClaimState) set(podKey, model string, binding utils.ModelClaimBinding) {
-	s.mu.Lock()
+	_ = s.setContext(context.Background(), podKey, model, binding)
+}
+
+func (s *modelClaimState) setContext(ctx context.Context, podKey, model string, binding utils.ModelClaimBinding) error {
+	if err := utils.LockContext(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	if s.bindings == nil {
 		s.bindings = make(map[string]map[string]modelClaimBinding)
@@ -65,10 +72,17 @@ func (s *modelClaimState) set(podKey, model string, binding utils.ModelClaimBind
 		s.bindings[model] = byPod
 	}
 	byPod[podKey] = modelClaimBinding{podKey: podKey, binding: binding}
+	return ctx.Err()
 }
 
 func (s *modelClaimState) clearPod(podKey string) {
-	s.mu.Lock()
+	_ = s.clearPodContext(context.Background(), podKey)
+}
+
+func (s *modelClaimState) clearPodContext(ctx context.Context, podKey string) error {
+	if err := utils.LockContext(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	for model, byPod := range s.bindings {
 		delete(byPod, podKey)
@@ -76,6 +90,7 @@ func (s *modelClaimState) clearPod(podKey string) {
 			delete(s.bindings, model)
 		}
 	}
+	return ctx.Err()
 }
 
 func (s *modelClaimState) get(model string) []modelClaimBinding {
@@ -93,18 +108,32 @@ func (s *modelClaimState) get(model string) []modelClaimBinding {
 // setClaim records a claim, in place of what was known of it before. A claim
 // that now serves another name no longer answers for the old one.
 func (s *modelClaimState) setClaim(key string, record modelClaimRecord) {
-	s.mu.Lock()
+	_ = s.setClaimContext(context.Background(), key, record)
+}
+
+func (s *modelClaimState) setClaimContext(ctx context.Context, key string, record modelClaimRecord) error {
+	if err := utils.LockContext(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	if s.claims == nil {
 		s.claims = make(map[string]modelClaimRecord)
 	}
 	s.claims[key] = record
+	return ctx.Err()
 }
 
 func (s *modelClaimState) clearClaim(key string) {
-	s.mu.Lock()
+	_ = s.clearClaimContext(context.Background(), key)
+}
+
+func (s *modelClaimState) clearClaimContext(ctx context.Context, key string) error {
+	if err := utils.LockContext(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	delete(s.claims, key)
+	return ctx.Err()
 }
 
 // claim returns the record of the first claim, by namespace and name, that
@@ -141,12 +170,19 @@ func (c *Store) ModelClaimBinding(modelName string) (*v1.Pod, utils.ModelClaimBi
 // setModelClaim records a ModelClaim object as the gateway sees it. A claim
 // being deleted is forgotten at once, since the model it serves is going away.
 func (c *Store) setModelClaim(claim *modelv1alpha1.ModelClaim) {
+	_ = c.setModelClaimContext(context.Background(), claim)
+}
+
+func (c *Store) setModelClaimContext(ctx context.Context, claim *modelv1alpha1.ModelClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	key := claim.Namespace + "/" + claim.Name
 	if !claim.DeletionTimestamp.IsZero() {
-		c.modelClaims.clearClaim(key)
-		return
+		return c.modelClaims.clearClaimContext(ctx, key)
 	}
-	c.modelClaims.setClaim(key, modelClaimRecord{
+	return c.modelClaims.setClaimContext(ctx, key, modelClaimRecord{
 		model:  modelClaimServedName(claim),
 		phase:  string(claim.Status.Phase),
 		reason: modelClaimReason(claim),
@@ -154,7 +190,15 @@ func (c *Store) setModelClaim(claim *modelv1alpha1.ModelClaim) {
 }
 
 func (c *Store) deleteModelClaim(claim *modelv1alpha1.ModelClaim) {
-	c.modelClaims.clearClaim(claim.Namespace + "/" + claim.Name)
+	_ = c.deleteModelClaimContext(context.Background(), claim)
+}
+
+func (c *Store) deleteModelClaimContext(ctx context.Context, claim *modelv1alpha1.ModelClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	return c.modelClaims.clearClaimContext(ctx, claim.Namespace+"/"+claim.Name)
 }
 
 // ModelClaimStatus reports the phase of the ModelClaim that serves a model,

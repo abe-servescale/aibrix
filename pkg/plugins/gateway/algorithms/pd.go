@@ -27,7 +27,7 @@ import (
 const RouterPD = pdrouter.RouterPD
 
 func init() {
-	Register(RouterPD, pdrouter.NewPDRouter)
+	RegisterContext(RouterPD, pdrouter.NewPDRouterWithLifetime)
 }
 
 // ValidateAndGetLLMEngine validates that all pods use the same LLM engine label and returns it.

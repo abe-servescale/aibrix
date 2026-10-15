@@ -42,7 +42,7 @@ var (
 )
 
 func init() {
-	Register(RouterExternal, NewExternalRouter)
+	registerLocal(RouterExternal, NewExternalRouter)
 }
 
 func NewExternalRouter() (types.Router, error) {

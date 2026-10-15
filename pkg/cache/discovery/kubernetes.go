@@ -19,6 +19,7 @@ package discovery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	crdinformers "github.com/vllm-project/aibrix/pkg/client/informers/externalversions"
@@ -37,7 +38,11 @@ import (
 
 // KubernetesProvider implements Provider using Kubernetes informers.
 type KubernetesProvider struct {
-	config *rest.Config
+	config        *rest.Config
+	namespace     string
+	confined      namespaceWatch
+	prepareEvent  func(context.Context, WatchEvent) error
+	completeEvent func(context.Context, WatchEvent) error
 	// watchModelAdapters keeps the existing adapter discovery behavior by default.
 	watchModelAdapters bool
 	// watchModelClaims adds ModelClaim objects to what is watched.
@@ -102,13 +107,13 @@ func (p *KubernetesProvider) configureModelListHealth(k8sClientSet kubernetes.In
 		return
 	}
 	health.snapshot = func(ctx context.Context) (sourceVersions, error) {
-		pods, err := listPodVersions(ctx, k8sClientSet)
+		pods, err := listPodVersionsForNamespace(ctx, k8sClientSet, p.namespace)
 		if err != nil {
 			return sourceVersions{}, err
 		}
 		adapters := make(map[string]objectVersion)
 		if p.watchModelAdapters {
-			adapters, err = listAdapterVersions(ctx, crdClientSet)
+			adapters, err = listAdapterVersionsForNamespace(ctx, crdClientSet, p.namespace)
 			if err != nil {
 				return sourceVersions{}, err
 			}
@@ -118,17 +123,26 @@ func (p *KubernetesProvider) configureModelListHealth(k8sClientSet kubernetes.In
 }
 
 func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan struct{}) error {
+	if p.namespace != "" {
+		return p.WatchContext(context.Background(), handler, stopCh)
+	}
+	return p.watchContext(context.Background(), handler, stopCh)
+}
+
+func (p *KubernetesProvider) watchContext(ctx context.Context, handler func(WatchEvent) bool, stopCh <-chan struct{}) error {
+	ctx, cancel := contextWithStop(ctx, stopCh)
+	defer cancel()
 	if err := v1alpha1scheme.AddToScheme(scheme.Scheme); err != nil {
 		return err
 	}
 
-	k8sClientSet, err := kubernetes.NewForConfig(p.config)
+	config := p.config
+	k8sClientSet, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	// Currently watches all pods cluster-wide (same as the old initCacheInformers).
-	factory := informers.NewSharedInformerFactoryWithOptions(k8sClientSet, 0)
+	factory := informers.NewSharedInformerFactoryWithOptions(k8sClientSet, 0, informers.WithNamespace(p.namespace))
 
 	podInformer := factory.Core().V1().Pods().Informer()
 	var modelInformer cache.SharedIndexInformer
@@ -136,15 +150,15 @@ func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan 
 	var crdFactory crdinformers.SharedInformerFactory
 	var crdClientSet v1alpha1.Interface
 	if p.watchModelAdapters || p.watchModelClaims {
-		crdClientSet, err = v1alpha1.NewForConfig(p.config)
+		crdClientSet, err = v1alpha1.NewForConfig(config)
 		if err != nil {
 			return err
 		}
-		crdFactory = crdinformers.NewSharedInformerFactoryWithOptions(crdClientSet, 0)
+		crdFactory = crdinformers.NewSharedInformerFactoryWithOptions(crdClientSet, 0, crdinformers.WithNamespace(p.namespace))
 		if p.watchModelAdapters {
 			modelInformer = crdFactory.Model().V1alpha1().ModelAdapters().Informer()
 		}
-		if p.watchModelClaims && canListModelClaims(crdClientSet) {
+		if p.watchModelClaims && canListModelClaimsForNamespace(ctx, crdClientSet, p.namespace) {
 			claimInformer = crdFactory.Model().V1alpha1().ModelClaims().Informer()
 		}
 	}
@@ -154,40 +168,12 @@ func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan 
 	// Events flow from the start — including during the initial list phase.
 	var requiredHandlers []cache.ResourceEventHandlerRegistration
 	registerHandlers := func(inf cache.SharedIndexInformer, required bool) error {
-		deliver := func(ev WatchEvent) {
-			if required && p.modelListHealth != nil {
-				p.modelListHealth.Apply(ev, handler)
-			} else {
-				handler(ev)
-			}
-		}
-		registration, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				deliver(WatchEvent{Type: EventAdd, Object: obj})
-			},
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				deliver(WatchEvent{Type: EventUpdate, Object: newObj, OldObject: oldObj})
-			},
-			DeleteFunc: func(obj interface{}) {
-				// Unwrap tombstones — K8s informers may deliver
-				// cache.DeletedFinalStateUnknown when a delete event is missed.
-				if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-					obj = tombstone.Obj
-				}
-				deliver(WatchEvent{Type: EventDelete, Object: obj})
-			},
-		})
+		registration, err := p.registerHandler(inf, required, handler)
 		if err != nil {
 			return err
 		}
-		if required && p.modelListHealth != nil {
+		if required {
 			requiredHandlers = append(requiredHandlers, registration)
-			if err := inf.SetWatchErrorHandler(func(_ *cache.Reflector, watchErr error) {
-				p.modelListHealth.Invalidate()
-				klog.ErrorS(watchErr, "Model-list discovery watch failed")
-			}); err != nil {
-				return err
-			}
 		}
 		return nil
 	}
@@ -224,8 +210,11 @@ func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan 
 	for _, registration := range requiredHandlers {
 		requiredSync = append(requiredSync, registration.HasSynced)
 	}
-	if !cache.WaitForCacheSync(stopCh, requiredSync...) {
-		return errors.New("timed out waiting for caches to sync")
+	if !cache.WaitForCacheSync(ctx.Done(), requiredSync...) {
+		if ctx.Err() != nil {
+			return fmt.Errorf("sync model discovery in namespace %q: %w", p.namespace, ctx.Err())
+		}
+		return errors.New("model discovery stopped before synchronization")
 	}
 
 	// Post-sync reconcile: re-emit all ModelAdapters to fix ordering.
@@ -238,19 +227,59 @@ func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan 
 		adapters := modelInformer.GetStore().List()
 		adapterCount = len(adapters)
 		for _, obj := range adapters {
-			ev := WatchEvent{Type: EventAdd, Object: obj}
-			if p.modelListHealth != nil {
-				p.modelListHealth.Apply(ev, handler)
-			} else {
-				handler(ev)
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+			p.deliver(WatchEvent{Type: EventAdd, Object: obj}, true, handler)
 		}
 	}
 
 	klog.InfoS("Kubernetes discovery provider initialized",
 		"pods", len(podInformer.GetStore().List()), "modelAdapters", adapterCount)
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (p *KubernetesProvider) deliver(ev WatchEvent, required bool, handler func(WatchEvent) bool) {
+	if !p.acceptEvent(ev) {
+		return
+	}
+	if required && p.modelListHealth != nil {
+		p.modelListHealth.Apply(ev, handler)
+	} else {
+		handler(ev)
+	}
+}
+
+func (p *KubernetesProvider) registerHandler(inf cache.SharedIndexInformer, required bool, handler func(WatchEvent) bool) (cache.ResourceEventHandlerRegistration, error) {
+	registration, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) { p.deliver(WatchEvent{Type: EventAdd, Object: obj}, required, handler) },
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			p.deliver(WatchEvent{Type: EventUpdate, Object: newObj, OldObject: oldObj}, required, handler)
+		},
+		DeleteFunc: func(obj interface{}) {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			if tombstone, ok := obj.(*cache.DeletedFinalStateUnknown); ok && tombstone != nil {
+				obj = tombstone.Obj
+			}
+			p.deliver(WatchEvent{Type: EventDelete, Object: obj}, required, handler)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if required && p.modelListHealth != nil {
+		err = inf.SetWatchErrorHandler(func(_ *cache.Reflector, watchErr error) {
+			p.modelListHealth.Invalidate()
+			klog.ErrorS(watchErr, "Model-list discovery watch failed")
+		})
+	}
+	return registration, err
 }
 
 // canListModelClaims lists ModelClaims once before they are watched. A role
@@ -258,9 +287,13 @@ func (p *KubernetesProvider) watch(handler func(WatchEvent) bool, stopCh <-chan 
 // here once, where an informer would log it every minute for as long as the
 // process runs. Any other error is left to the informer, which retries it.
 func canListModelClaims(client v1alpha1.Interface) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return canListModelClaimsForNamespace(context.Background(), client, metav1.NamespaceAll)
+}
+
+func canListModelClaimsForNamespace(ctx context.Context, client v1alpha1.Interface, namespace string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, err := client.ModelV1alpha1().ModelClaims(metav1.NamespaceAll).List(ctx, metav1.ListOptions{Limit: 1})
+	_, err := client.ModelV1alpha1().ModelClaims(namespace).List(ctx, metav1.ListOptions{Limit: 1})
 	if apierrors.IsForbidden(err) || apierrors.IsNotFound(err) {
 		klog.InfoS("Not watching ModelClaims: a model that is claimed but not placed yet "+
 			"is answered as one that does not exist", "err", err)

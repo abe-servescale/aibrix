@@ -17,6 +17,7 @@ limitations under the License.
 package prefixcacheindexer
 
 import (
+	"context"
 	"encoding/binary"
 	"math/rand"
 	"strconv"
@@ -53,8 +54,14 @@ var (
 )
 
 func GetSharedPrefixHashTable() *PrefixHashTable {
+	return GetSharedPrefixHashTableWithContext(context.Background())
+}
+
+// GetSharedPrefixHashTableWithContext preserves shared state and assigns the
+// eviction worker to its first owner's lifetime. That owner must call Close.
+func GetSharedPrefixHashTableWithContext(lifetime context.Context) *PrefixHashTable {
 	sharedOnce.Do(func() {
-		sharedInstance = NewPrefixHashTable()
+		sharedInstance = NewPrefixHashTableWithContext(lifetime)
 	})
 	return sharedInstance
 }
@@ -103,6 +110,12 @@ func prefixCacheHashSeed() uint64 {
 }
 
 func NewPrefixHashTable() *PrefixHashTable {
+	return NewPrefixHashTableWithContext(context.Background())
+}
+
+// NewPrefixHashTableWithContext starts eviction under lifetime; Close cancels
+// and awaits it. Canceling lifetime alone does not discard the stored entries.
+func NewPrefixHashTableWithContext(lifetime context.Context) *PrefixHashTable {
 	seed := prefixCacheHashSeed()
 	klog.InfoS("prefix_cache_hash_table_configurations",
 		"prefix_cache_hash_seed", seed,
@@ -113,9 +126,16 @@ func NewPrefixHashTable() *PrefixHashTable {
 		"prefix_cache_block_eviction_duration_minutes", prefixCacheEvictionDuration)
 	instance := &PrefixHashTable{
 		seed:  seed,
-		store: lrustore.NewLRUStore[uint64, Block](prefixCacheBlockNumber, prefixCacheEvictionDuration, prefixCacheEvictionInterval, func() time.Time { return time.Now() }),
+		store: lrustore.NewLRUStoreWithContext[uint64, Block](lifetime, prefixCacheBlockNumber, prefixCacheEvictionDuration, prefixCacheEvictionInterval, func() time.Time { return time.Now() }),
 	}
 	return instance
+}
+
+// Close stops and awaits the table's eviction worker; cached data stays readable.
+func (c *PrefixHashTable) Close() {
+	if closer, ok := c.store.(interface{ Close() }); ok {
+		closer.Close()
+	}
 }
 
 // EnableDeltaSync initializes dirty-set tracking so GetDeltaForSync/ClearDirtyForSync
@@ -171,14 +191,28 @@ func (c *PrefixHashTable) seqSearchPrefix(prefixHashes []uint64, model string, r
 
 // AddPrefix add prefix hashes for input tokens. pod is the pod key, namespace/name.
 func (c *PrefixHashTable) AddPrefix(prefixHashes []uint64, model, pod string) {
-	c.mu.Lock()
+	_ = c.AddPrefixContext(context.Background(), prefixHashes, model, pod)
+}
+
+// AddPrefixContext cancels lock waits and stops adding blocks when ctx ends.
+// A canceled update may have added earlier blocks; it returns ctx's error.
+func (c *PrefixHashTable) AddPrefixContext(ctx context.Context, prefixHashes []uint64, model, pod string) error {
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	for i := 0; i < len(prefixHashes); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		prefixHash := prefixHashes[i]
 
-		block, ok := c.store.Get(prefixHash)
+		block, ok, err := c.getBlockContext(ctx, prefixHash)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			block = Block{
 				modelToPods: map[string]map[string]time.Time{
@@ -194,12 +228,55 @@ func (c *PrefixHashTable) AddPrefix(prefixHashes []uint64, model, pod string) {
 			block.modelToPods[model] = blockPods
 		}
 
-		c.store.Put(prefixHash, block)
+		if err := c.putBlockContext(ctx, prefixHash, block); err != nil {
+			return err
+		}
 		if c.dirtyIds != nil {
 			c.dirtySeq++
 			c.dirtyIds[strconv.FormatUint(prefixHash, 10)] = c.dirtySeq
 		}
 	}
+	return nil
+}
+
+func (c *PrefixHashTable) getBlockContext(ctx context.Context, key uint64) (Block, bool, error) {
+	if store, ok := c.store.(interface {
+		GetContext(context.Context, uint64) (Block, bool, error)
+	}); ok {
+		return store.GetContext(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return Block{}, false, err
+	}
+	block, exists := c.store.Get(key)
+	return block, exists, ctx.Err()
+}
+
+func (c *PrefixHashTable) putBlockContext(ctx context.Context, key uint64, block Block) error {
+	if store, ok := c.store.(interface {
+		PutContext(context.Context, uint64, Block) (bool, error)
+	}); ok {
+		_, err := store.PutContext(ctx, key, block)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.store.Put(key, block)
+	return ctx.Err()
+}
+
+func (c *PrefixHashTable) rangeBlocksContext(ctx context.Context, fn func(uint64, Block) bool) error {
+	if store, ok := c.store.(interface {
+		RangeContext(context.Context, func(uint64, Block) bool) error
+	}); ok {
+		return store.RangeContext(ctx, fn)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.store.Range(fn)
+	return ctx.Err()
 }
 
 // matchPods returns ready pods that intersect with pods on which prefix tokens are catched.

@@ -133,7 +133,7 @@ type RedisBackedRouter interface {
 }
 
 func init() {
-	Register(RouterSessionAffinity, NewSessionAffinityRouter)
+	registerLocal(RouterSessionAffinity, NewSessionAffinityRouter)
 }
 
 type sessionAffinityRouter struct {
@@ -158,6 +158,12 @@ type sessionAffinityRouter struct {
 	// rendezvous hashing, exactly as before Redis support was added.
 	redisClient *redis.Client
 	startOnce   sync.Once
+	lifetime    context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	tasksMu     sync.Mutex
+	closing     bool
+	tasks       sync.WaitGroup
 }
 
 func NewSessionAffinityRouter() (types.Router, error) {
@@ -170,24 +176,67 @@ func NewSessionAffinityRouter() (types.Router, error) {
 // too. Idempotent (only the first call takes effect) and a no-op when
 // redisClient is nil. Stops when stopCh is closed.
 func (r *sessionAffinityRouter) Start(stopCh <-chan struct{}, redisClient *redis.Client) {
+	r.start(context.Background(), stopCh, redisClient)
+}
+
+// StartWithContext owns background Redis reconciliation under lifetime.
+func (r *sessionAffinityRouter) StartWithContext(lifetime context.Context, redisClient *redis.Client) {
+	r.start(lifetime, nil, redisClient)
+}
+
+func (r *sessionAffinityRouter) start(lifetime context.Context, stopCh <-chan struct{}, redisClient *redis.Client) {
 	if redisClient == nil {
 		return
 	}
 	r.startOnce.Do(func() {
 		r.redisClient = redisClient
+		r.lifetime, r.cancel = context.WithCancel(lifetime)
+		r.done = make(chan struct{})
 		ticker := time.NewTicker(sessionKeyCacheSyncInterval)
-		go func() {
+		r.startTask(func() {
+			defer close(r.done)
+			defer ticker.Stop()
 			for {
 				select {
+				case <-r.lifetime.Done():
+					return
+				case <-stopCh:
+					return
 				case <-ticker.C:
 					r.syncSessionKeyPodsFromRedis()
-				case <-stopCh:
-					ticker.Stop()
-					return
 				}
 			}
-		}()
+		})
 	})
+}
+
+func (r *sessionAffinityRouter) runtimeContext() context.Context {
+	if r.lifetime != nil {
+		return r.lifetime
+	}
+	return context.Background()
+}
+
+// Cleanup cancels and awaits the selected session reconciliation worker.
+func (r *sessionAffinityRouter) Cleanup() error {
+	r.tasksMu.Lock()
+	r.closing = true
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.tasksMu.Unlock()
+	r.tasks.Wait()
+	return nil
+}
+
+func (r *sessionAffinityRouter) startTask(task func()) {
+	r.tasksMu.Lock()
+	defer r.tasksMu.Unlock()
+	if r.closing {
+		return
+	}
+	r.tasks.Add(1)
+	go func() { defer r.tasks.Done(); task() }()
 }
 
 // syncSessionKeyPodsFromRedis reconciles this replica's local sessionKeyPods
@@ -220,7 +269,7 @@ func (r *sessionAffinityRouter) syncSessionKeyPodsFromRedis() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), sessionKeyCacheSyncInterval)
+	ctx, cancel := context.WithTimeout(r.runtimeContext(), sessionKeyCacheSyncInterval)
 	defer cancel()
 
 	for batchStart := 0; batchStart < len(sessionKeys); batchStart += sessionKeyCacheSyncBatchSize {
@@ -375,7 +424,7 @@ func (r *sessionAffinityRouter) persistSessionKeyToRedis(cacheKey, addr string, 
 	if r.redisClient == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sessionKeyRedisWriteTimeout)
+	ctx, cancel := context.WithTimeout(r.runtimeContext(), sessionKeyRedisWriteTimeout)
 	defer cancel()
 	if mode == writeClaim {
 		claimed, err := r.redisClient.SetNX(ctx, sessionAffinityRedisKey(cacheKey), addr, sessionAffinityTTL).Result()
@@ -435,7 +484,7 @@ func (r *sessionAffinityRouter) persistSessionKeyToRedis(cacheKey, addr string, 
 // rendezvous pick after a pod-set change, is left alone. A failed read leaves the entry as
 // is; the sync pass or this key's next Redis read converges it then.
 func (r *sessionAffinityRouter) reconcileLostClaim(cacheKey, addr string) {
-	ctx, cancel := context.WithTimeout(context.Background(), sessionKeyRedisReadTimeout)
+	ctx, cancel := context.WithTimeout(r.runtimeContext(), sessionKeyRedisReadTimeout)
 	defer cancel()
 	winner, err := r.redisClient.Get(ctx, sessionAffinityRedisKey(cacheKey)).Result()
 	if err != nil {
@@ -487,7 +536,7 @@ func (r *sessionAffinityRouter) observeSessionKeyAddr(cacheKey string) string {
 	if r.redisClient == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sessionKeyRedisReadTimeout)
+	ctx, cancel := context.WithTimeout(r.runtimeContext(), sessionKeyRedisReadTimeout)
 	defer cancel()
 	val, err := r.redisClient.Get(ctx, sessionAffinityRedisKey(cacheKey)).Result()
 	if err != nil {
@@ -619,7 +668,7 @@ func (r *sessionAffinityRouter) rememberSessionKey(ctx *types.RoutingContext, se
 	}
 	cacheKey := sessionCacheKey(ctx.Model, sessionKey)
 	r.storeSessionKeyLocal(cacheKey, addr, false)
-	go r.persistSessionKeyToRedis(cacheKey, addr, mode, oldAddr)
+	r.startTask(func() { r.persistSessionKeyToRedis(cacheKey, addr, mode, oldAddr) })
 }
 
 // loadCachedAddr returns the locally cached address for cacheKey. confirmed reports whether
@@ -647,7 +696,7 @@ func (r *sessionAffinityRouter) readSessionKeyFromRedis(ctx *types.RoutingContex
 	if r.redisClient == nil {
 		return "", false
 	}
-	readCtx, cancel := context.WithTimeout(context.Background(), sessionKeyRedisReadTimeout)
+	readCtx, cancel := context.WithTimeout(r.runtimeContext(), sessionKeyRedisReadTimeout)
 	defer cancel()
 	val, err := r.redisClient.Get(readCtx, sessionAffinityRedisKey(cacheKey)).Result()
 	if err != nil {
@@ -894,7 +943,7 @@ func (r *sessionAffinityRouter) PostRouteUpdate(ctx *types.RoutingContext, ready
 	if sessionKey := ctx.ReqHeaders[constants.HeaderSessionKey]; validSessionKey(sessionKey) && r.redisClient != nil {
 		cacheKey := sessionCacheKey(ctx.Model, sessionKey)
 		r.storeSessionKeyLocal(cacheKey, addr, false)
-		go r.commitFinalTarget(cacheKey, addr)
+		r.startTask(func() { r.commitFinalTarget(cacheKey, addr) })
 	}
 	return nil
 }

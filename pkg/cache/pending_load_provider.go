@@ -86,3 +86,7 @@ func (p *PendingLoadProvider) GetConsumption(ctx *types.RoutingContext, pod *v1.
 		return 1.0 / lambda / meanLatency, nil
 	}
 }
+
+// NewPendingLoadProviderWithCache uses explicit cache state during gateway
+// startup, before the process singleton is published.
+func NewPendingLoadProviderWithCache(c Cache) *PendingLoadProvider { return newPendingLoadProvider(c) }

@@ -27,6 +27,6 @@ const RouterPrefixCache = prefixcache.RouterPrefixCache
 const RouterPrefixCachePreble = prefixcache.RouterPrefixCachePreble
 
 func init() {
-	Register(RouterPrefixCache, prefixcache.NewPrefixCacheRouter)
-	Register(RouterPrefixCachePreble, prefixcache.NewPrefixCacheAndLoadRouter)
+	RegisterContext(RouterPrefixCache, prefixcache.NewPrefixCacheRouterWithContext)
+	RegisterContext(RouterPrefixCachePreble, prefixcache.NewPrefixCacheAndLoadRouterWithContext)
 }

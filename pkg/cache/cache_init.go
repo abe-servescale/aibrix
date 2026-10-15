@@ -40,12 +40,18 @@ import (
 )
 
 var (
-	store = &Store{} // Global cache store instance
-	once  sync.Once  // Singleton pattern control lock
+	store   = &Store{} // Global cache store instance
+	once    sync.Once  // Singleton pattern control lock
+	initErr error
 )
+
+var gatewayInitMu sync.Mutex
 
 // InitOptions configures the cache initialization behavior
 type InitOptions struct {
+	ModelRouterProviderWithContext ModelRouterProviderContextFunc
+	// InstallationNamespace is required for Kubernetes gateway discovery.
+	InstallationNamespace string
 	// IsGateway marks the caller as the gateway-plugins service.
 	IsGateway bool
 
@@ -82,12 +88,26 @@ const (
 
 // Store contains core data structures and components of the caching system
 type Store struct {
-	mu                  sync.RWMutex            // Read-write lock for concurrency safety
-	initialized         bool                    // Initialization status flag
-	redisClient         *redis.Client           // Redis client instance
-	admitRedisClient    *redis.Client           // redisClient without go-redis retries, for the admit script
-	prometheusApi       prometheusv1.API        // Prometheus API client
-	modelRouterProvider ModelRouterProviderFunc // Function to get model router
+	lifetimeCtx           context.Context
+	contextRouterProvider ModelRouterProviderContextFunc
+	prepareRouterMu       sync.Mutex
+	preparedRouters       utils.SyncMap[string, *preparedModelRouter]
+	gatewayCleanup        func()
+	cancelLifetime        context.CancelFunc
+	closeOnce             sync.Once
+	backgroundOnce        sync.Once
+	ownedTasks            sync.WaitGroup
+	ownedMu               sync.Mutex
+	closing               bool
+	// Namespace actually synchronized by Kubernetes discovery. Empty means
+	// unconfined or non-Kubernetes discovery, regardless of caller options.
+	installationNamespace string
+	mu                    sync.RWMutex            // Read-write lock for concurrency safety
+	initialized           bool                    // Initialization status flag
+	admitRedisClient      *redis.Client           // admission scripts must not retry
+	redisClient           *redis.Client           // Redis client instance
+	prometheusApi         prometheusv1.API        // Prometheus API client
+	modelRouterProvider   ModelRouterProviderFunc // Function to get model router
 
 	disableModelClaimBindings bool // Whether to ignore ModelClaim Pod annotations
 
@@ -99,9 +119,10 @@ type Store struct {
 	engineMetricsFetcher *metrics.EngineMetricsFetcher // Centralized typed metrics fetcher
 
 	// Request trace fields
-	enableTracing bool                                   // Default to load from enableGPUOptimizerTracing, can be configured.
-	requestTrace  *utils.SyncMap[string, *RequestTrace]  // Request trace data (model_name -> *RequestTrace)
-	podStats      utils.SyncMap[string, *podStatsRecord] // Request stats data bound to request completion, not pod lifetime.
+	enableTracing  bool // Default to load from enableGPUOptimizerTracing, can be configured.
+	requestTraceMu sync.RWMutex
+	requestTrace   *utils.SyncMap[string, *RequestTrace]  // Request trace data (model_name -> *RequestTrace)
+	podStats       utils.SyncMap[string, *podStatsRecord] // Request stats data bound to request completion, not pod lifetime.
 
 	// Pod related storage
 	metaPods utils.SyncMap[string, *Pod] // pod_namespace/pod_name -> *Pod
@@ -159,6 +180,7 @@ type Store struct {
 
 	// KV event management - optional enhancement
 	kvEventManager *KVEventManager
+	publishedKV    atomic.Pointer[KVEventManager]
 
 	// Prometheus event queue
 	promqlJobs chan *Pod
@@ -206,6 +228,12 @@ type Store struct {
 //	Cache: Cache interface instance
 //	error: Returns error if cache is not initialized
 func Get() (Cache, error) {
+	if gateway := gatewayPublished.Load(); gateway != nil {
+		if err := gateway.lifetimeCtx.Err(); err != nil {
+			return nil, fmt.Errorf("gateway cache stopped: %w", err)
+		}
+		return gateway, nil
+	}
 	if !store.initialized {
 		return nil, errors.New("cache is not initialized")
 	}
@@ -222,10 +250,18 @@ func Get() (Cache, error) {
 //
 //	Store: Initialized cache store instance
 func New(redisClient *redis.Client, prometheusApi prometheusv1.API, modelRouterProvider ModelRouterProviderFunc) *Store {
+	store = newStore(redisClient, prometheusApi, modelRouterProvider)
+	for w := 0; w < store.podMetricsWorkerCount; w++ {
+		go store.worker(store.podMetricsJobs)
+	}
+	return store
+}
+
+func newStore(redisClient *redis.Client, prometheusApi prometheusv1.API, modelRouterProvider ModelRouterProviderFunc) *Store {
 	podMetricsWorkerCount := loadPodMetricsWorkerCount()
 	podMetricsJobQueueSize := loadPodMetricsJobQueueSize(podMetricsWorkerCount)
 
-	store = &Store{
+	instance := &Store{
 		initialized:           true,
 		redisClient:           redisClient,
 		admitRedisClient:      admitRunningRequestsClient(redisClient),
@@ -239,12 +275,7 @@ func New(redisClient *redis.Client, prometheusApi prometheusv1.API, modelRouterP
 		enableProfileCaching:  enableModelGPUProfileCaching,
 	}
 
-	// Start podMetrics worker pool
-	for w := 0; w < store.podMetricsWorkerCount; w++ {
-		go store.worker(store.podMetricsJobs)
-	}
-
-	return store
+	return instance
 }
 
 // NewForTest initializes the cache store for testing purposes, it can be repeated call for reset.
@@ -401,7 +432,54 @@ func InitForTest() *Store {
 //
 //	*Store: Pointer to initialized store instance
 func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptions) *Store {
+	result, err := InitWithContext(context.Background(), config, stopCh, opts)
+	if err != nil {
+		klog.Fatalf("Failed to initialize cache: %v", err)
+	}
+	return result
+}
+
+// InitWithContext initializes the cache, bounding discovery by ctx while stopCh
+// owns continuing watches. Kubernetes gateway callers must supply a matching,
+// namespaced provider or a required InstallationNamespace for implicit discovery.
+// Errors do not fall back to cluster-wide discovery or mark failed state ready.
+func InitWithContext(ctx context.Context, config *rest.Config, stopCh <-chan struct{}, opts InitOptions) (*Store, error) {
+	if opts.IsGateway && (opts.DiscoveryProvider == nil || opts.DiscoveryProvider.Type() == "kubernetes") {
+		lifetime, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-stopCh:
+				cancel()
+			case <-lifetime.Done():
+			}
+		}()
+		st, err := InitGatewayWithOptions(ctx, lifetime, config, opts)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		go func() { <-st.lifetimeCtx.Done(); cancel() }()
+		return st, nil
+	}
+
+	return initWithContextLegacy(ctx, config, stopCh, opts)
+}
+
+func initWithContextLegacy(ctx context.Context, config *rest.Config, stopCh <-chan struct{}, opts InitOptions) (*Store, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	provider, err := gatewayDiscoveryProvider(config, opts)
+	if err != nil {
+		return nil, err
+	}
+	opts.DiscoveryProvider = provider
 	once.Do(func() {
+		defer func() {
+			if initErr != nil {
+				store.initialized = false
+			}
+		}()
 		// Log initialization based on configuration
 		service := serviceIdentity(opts)
 
@@ -430,9 +508,6 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 			// watches ModelClaims, to answer for a claimed model that no pod
 			// advertises yet.
 			kubernetesProvider := discovery.NewKubernetesProvider(config)
-			if opts.IsGateway {
-				kubernetesProvider.WithModelClaims()
-			}
 			provider = kubernetesProvider
 		}
 		if opts.ModelListMaxAge > 0 {
@@ -442,11 +517,16 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 			case *discovery.StaticProvider:
 				// Static discovery has no continuing watch after its file is loaded.
 			default:
-				klog.Fatalf("Model-list verification is unsupported by discovery provider %q", provider.Type())
+				initErr = fmt.Errorf("model-list verification is unsupported by discovery provider %q", provider.Type())
+				return
 			}
 		}
-		if err := initDiscoveryProvider(store, provider, stopCh); err != nil {
-			klog.Fatalf("Failed to initialize discovery provider: %v", err)
+		if err := initDiscoveryProviderContext(ctx, store, provider, stopCh); err != nil {
+			initErr = err
+			return
+		}
+		if kubernetesProvider, ok := provider.(*discovery.KubernetesProvider); ok {
+			store.installationNamespace = kubernetesProvider.Namespace()
 		}
 		klog.InfoS("Using discovery provider", "type", provider.Type())
 		initMetricsCache(store, stopCh)
@@ -458,7 +538,7 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 
 		// Initialize trace cache if enabled and Redis is available
 		if store.enableTracing && opts.RedisClient != nil {
-			initTraceCache(opts.RedisClient, stopCh)
+			initTraceCache(store, stopCh)
 		}
 
 		// Initialize gateway snapshot sync if Redis is available
@@ -477,7 +557,8 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 		// Initialize KV event sync if enabled
 		if opts.EnableKVSync {
 			if opts.RedisClient == nil {
-				klog.Fatalf("InitOptions: EnableKVSync is true but RedisClient is nil")
+				initErr = fmt.Errorf("KV event synchronization requires Redis")
+				return
 			}
 			if err := store.initKVEventSync(); err != nil {
 				klog.Errorf("Failed to initialize KV event sync: %v", err)
@@ -486,7 +567,41 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 		}
 	})
 
-	return store
+	if initErr != nil {
+		return nil, initErr
+	}
+	if opts.IsGateway && provider != nil && provider.Type() == "kubernetes" && store.installationNamespace != opts.InstallationNamespace {
+		return nil, fmt.Errorf("cache already belongs to a different or unconfined installation namespace")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+func gatewayDiscoveryProvider(config *rest.Config, opts InitOptions) (discovery.Provider, error) {
+	provider := opts.DiscoveryProvider
+	if !opts.IsGateway || (provider != nil && provider.Type() != "kubernetes") {
+		return provider, nil
+	}
+	if err := discovery.ValidateNamespace(opts.InstallationNamespace); err != nil {
+		return nil, err
+	}
+	if provider != nil {
+		selected, ok := provider.(*discovery.KubernetesProvider)
+		if !ok || selected == nil || selected.Namespace() != opts.InstallationNamespace {
+			return nil, fmt.Errorf("gateway discovery must use installation namespace %q", opts.InstallationNamespace)
+		}
+		return provider, nil
+	}
+	created, err := discovery.NewKubernetesProviderForNamespace(config, opts.InstallationNamespace)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.DisableModelClaimPodBindings {
+		created.WithModelClaims()
+	}
+	return created, nil
 }
 
 // serviceIdentity returns the component identity implied by opts.
@@ -507,9 +622,10 @@ func serviceIdentity(opts InitOptions) string {
 //	store: Cache store instance
 //	stopCh: Stop signal channel
 func initMetricsCache(store *Store, stopCh <-chan struct{}) {
-	ticker := time.NewTicker(podMetricRefreshInterval)
 	store.initPromQLWorker(stopCh)
-	go func() {
+	store.startOwnedTask(func() {
+		ticker := time.NewTicker(podMetricRefreshInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
@@ -524,17 +640,26 @@ func initMetricsCache(store *Store, stopCh <-chan struct{}) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // initDiscoveryProvider initializes the cache using a discovery provider.
 // All initial state and ongoing changes are delivered through Watch().
 func initDiscoveryProvider(store *Store, provider discovery.Provider, stopCh <-chan struct{}) error {
+	return initDiscoveryProviderContext(context.Background(), store, provider, stopCh)
+}
+
+func initDiscoveryProviderContext(ctx context.Context, store *Store, provider discovery.Provider, stopCh <-chan struct{}) error {
 	apply := func(ev discovery.WatchEvent) bool {
 		return handleDiscoveryObject(store, ev.Type, ev.Object, ev.OldObject)
 	}
 	var err error
-	if kubernetesProvider, ok := provider.(*discovery.KubernetesProvider); ok && kubernetesProvider.ModelListHealth() != nil {
+	if kubernetesProvider, ok := provider.(*discovery.KubernetesProvider); ok && kubernetesProvider.Namespace() != "" {
+		err = kubernetesProvider.WatchContext(ctx, apply, stopCh)
+		if err == nil {
+			store.modelListHealth = kubernetesProvider.ModelListHealth()
+		}
+	} else if kubernetesProvider, ok := provider.(*discovery.KubernetesProvider); ok && kubernetesProvider.ModelListHealth() != nil {
 		err = kubernetesProvider.WatchApplied(apply, stopCh)
 		if err == nil {
 			store.modelListHealth = kubernetesProvider.ModelListHealth()
@@ -549,6 +674,25 @@ func initDiscoveryProvider(store *Store, provider discovery.Provider, stopCh <-c
 }
 
 func handleDiscoveryObject(store *Store, evType discovery.EventType, obj, oldObj any) bool {
+	if store.installationNamespace != "" {
+		metadata, ok := obj.(interface {
+			GetNamespace() string
+			GetName() string
+		})
+		if !ok || metadata.GetNamespace() != store.installationNamespace {
+			return false
+		}
+		if evType == discovery.EventUpdate {
+			old, ok := oldObj.(interface {
+				GetNamespace() string
+				GetName() string
+			})
+			if !ok || old.GetNamespace() != store.installationNamespace {
+				return false
+			}
+		}
+	}
+
 	switch o := obj.(type) {
 	case *v1.Pod:
 		switch evType {
@@ -611,19 +755,20 @@ func initProfileCache(store *Store, stopCh <-chan struct{}, forTesting bool) {
 		klog.Warning("Redis client is nil, skipping deployment profile cache updates")
 		return
 	}
-	ticker := time.NewTicker(defaultModelGPUProfileRefreshInterval)
-	go func() {
+	store.startOwnedTask(func() {
+		ticker := time.NewTicker(defaultModelGPUProfileRefreshInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				// Periodically update metrics
-				store.updateDeploymentProfiles(context.Background())
+				store.updateDeploymentProfiles(store.runtimeContext())
 			case <-stopCh:
 				ticker.Stop()
 				return
 			}
 		}
-	}()
+	})
 }
 
 // initTraceCache initializes request tracing cache
@@ -631,23 +776,23 @@ func initProfileCache(store *Store, stopCh <-chan struct{}, forTesting bool) {
 //
 //	redisClient: Redis client instance
 //	stopCh: Stop signal channel
-func initTraceCache(redisClient *redis.Client, stopCh <-chan struct{}) {
-	// Calculate time offset for window alignment
-	tickerOffset := time.Duration(time.Now().UnixNano()) % RequestTraceWriteInterval
-	var traceAlignmentTimer *time.Timer
-	var traceTicker *time.Ticker
-
-	// Select alignment method based on offset
-	if tickerOffset > MaxRequestTraceIntervalOffset {
-		traceAlignmentTimer = time.NewTimer(RequestTraceWriteInterval - tickerOffset)
-	} else {
-		traceTicker = time.NewTicker(RequestTraceWriteInterval)
+func initTraceCache(owner *Store, stopCh <-chan struct{}) {
+	if owner.redisClient == nil {
+		return
 	}
+	owner.startOwnedTask(func() {
+		// Calculate time offset for window alignment
+		tickerOffset := time.Duration(time.Now().UnixNano()) % RequestTraceWriteInterval
+		var traceAlignmentTimer *time.Timer
+		var traceTicker *time.Ticker
 
-	go func() {
-		if redisClient == nil {
-			return
+		// Select alignment method based on offset
+		if tickerOffset > MaxRequestTraceIntervalOffset {
+			traceAlignmentTimer = time.NewTimer(RequestTraceWriteInterval - tickerOffset)
+		} else {
+			traceTicker = time.NewTicker(RequestTraceWriteInterval)
 		}
+
 		if traceAlignmentTimer != nil {
 			// Wait for time window alignment, but bail out early if shutdown is
 			// requested during the alignment phase to avoid leaking the Timer.
@@ -665,18 +810,13 @@ func initTraceCache(redisClient *redis.Client, stopCh <-chan struct{}) {
 			select {
 			case <-traceTicker.C:
 				// Periodically write trace data to storage
-				if atomic.LoadInt32(&store.numRequestsTraces) == 0 {
-					continue
-				}
-				t := time.Now().Unix()
-				roundT := t - t%int64(RequestTraceWriteInterval/time.Second)
-				store.writeRequestTraceToStorage(roundT)
+				owner.flushTraceTick(owner.runtimeContext(), time.Now())
 			case <-stopCh:
 				traceTicker.Stop()
 				return
 			}
 		}
-	}()
+	})
 }
 
 // initKVEventSync initializes the KV event synchronization system
@@ -719,7 +859,7 @@ func (s *Store) initKVEventSync() error {
 	}
 
 	// Create sync indexer after validation passes - use shared singleton
-	s.syncPrefixIndexer = syncindexer.GetSharedSyncPrefixHashTable()
+	s.syncPrefixIndexer = syncindexer.GetSharedSyncPrefixHashTableWithContext(s.runtimeContext())
 	if s.syncPrefixIndexer == nil {
 		return fmt.Errorf("failed to create sync prefix indexer")
 	}
@@ -731,6 +871,7 @@ func (s *Store) initKVEventSync() error {
 
 	// Mark as successfully initialized
 	initialized = true
+	s.publishedKV.Store(s.kvEventManager)
 	klog.Info("KV event synchronization initialized successfully")
 
 	return nil
@@ -738,6 +879,7 @@ func (s *Store) initKVEventSync() error {
 
 // cleanupKVEventSync cleans up partially initialized KV event sync resources
 func (s *Store) cleanupKVEventSync() {
+	s.publishedKV.Store(nil)
 	klog.Info("Cleaning up KV event sync resources")
 
 	// Stop event manager if it exists
@@ -746,12 +888,12 @@ func (s *Store) cleanupKVEventSync() {
 		s.kvEventManager = nil
 	}
 
-	// Clear sync indexer reference
-	// NOTE: Do NOT call Close() on the shared singleton instance
-	// as it may still be used by other components (e.g., gateway router).
-	// The singleton's lifecycle is managed globally and should only be
-	// closed during process shutdown, not during Store cleanup.
+	// The confined gateway owns the shared table until process shutdown.
+	// Legacy Store cleanup retains the existing shared-table behavior.
 	if s.syncPrefixIndexer != nil {
+		if s.lifetimeCtx != nil {
+			s.syncPrefixIndexer.Close()
+		}
 		s.syncPrefixIndexer = nil
 	}
 }
@@ -764,7 +906,27 @@ func (s *Store) GetSyncPrefixIndexer() *syncindexer.SyncPrefixHashTable {
 }
 
 // Close gracefully shuts down the cache store
-func (s *Store) Close() {
+func (s *Store) Close() { s.closeOnce.Do(s.close) }
+
+func (s *Store) close() {
+	s.ownedMu.Lock()
+	s.closing = true
+	s.ownedMu.Unlock()
+	if s.cancelLifetime != nil {
+		s.cancelLifetime()
+	}
+	s.backgroundOnce.Do(func() {})
+	if s.gatewayCleanup != nil {
+		s.gatewayCleanup()
+	}
+	s.preparedRouters.Range(func(_ string, model *preparedModelRouter) bool {
+		if closer, ok := model.router.(interface{ Close() }); ok {
+			closer.Close()
+		}
+		return true
+	})
+	s.ownedTasks.Wait()
+
 	klog.Info("Closing cache store")
 
 	// Clean up KV event sync resources
@@ -797,7 +959,7 @@ func (c *Store) initPromQLWorker(stopCh <-chan struct{}) {
 		return
 	}
 	c.promqlJobs = make(chan *Pod, 2*c.podMetricsWorkerCount)
-	go c.promQueryLoop(stopCh)
+	c.startOwnedTask(func() { c.promQueryLoop(stopCh) })
 }
 
 func (c *Store) promQueryLoop(stopCh <-chan struct{}) {

@@ -175,7 +175,7 @@ func (c *Store) incrPodRunningRequests(namespace, name string) bool {
 	if c.redisClient == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsWriteTimeout)
 	defer cancel()
 	key := runningRequestsKey(namespace, name)
 	if _, err := c.redisClient.Eval(ctx, runningRequestsIncrDecrScript, []string{key},
@@ -195,7 +195,7 @@ func (c *Store) decrPodRunningRequests(namespace, name string) {
 	if c.redisClient == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsWriteTimeout)
 	defer cancel()
 	key := runningRequestsKey(namespace, name)
 	if _, err := c.redisClient.Eval(ctx, runningRequestsIncrDecrScript, []string{key},
@@ -313,7 +313,7 @@ func (c *Store) admitRunningRequest(namespace, name string, limit, localRunning 
 	if c.redisClient == nil {
 		return localRunning < limit, false, localRunning
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsReadTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsReadTimeout)
 	defer cancel()
 	key := runningRequestsKey(namespace, name)
 	client := c.admitRedisClient
@@ -427,7 +427,7 @@ func (c *Store) heartbeatRunningRequestsLiveness() {
 // corrected for) over that one second -- negligible next to
 // runningRequestsLivenessWindow.
 func (c *Store) writeRunningRequestsLivenessHeartbeat() {
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsWriteTimeout)
 	defer cancel()
 	pipe := c.redisClient.Pipeline()
 	timeCmd := pipe.Time(ctx)
@@ -451,11 +451,13 @@ func (c *Store) scheduleRunningRequestsHygiene() {
 	if !c.runningRequestsHygieneBusy.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	if !c.startOwnedTask(func() {
 		defer c.runningRequestsHygieneBusy.Store(false)
 		c.refreshInFlightPodHashTTLs()
 		c.flushPendingRunningRequestsPrunes()
-	}()
+	}) {
+		c.runningRequestsHygieneBusy.Store(false)
+	}
 }
 
 // refreshInFlightPodHashTTLs PEXPIREs every pod this gateway currently has in-flight
@@ -466,7 +468,7 @@ func (c *Store) scheduleRunningRequestsHygiene() {
 // incr/decr still refresh TTL on their own writes. Must not run on the ticker
 // goroutine (see scheduleRunningRequestsHygiene).
 func (c *Store) refreshInFlightPodHashTTLs() {
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsWriteTimeout)
 	defer cancel()
 	pipe := c.redisClient.Pipeline()
 	n := 0
@@ -496,10 +498,10 @@ func initRunningRequestsLiveness(store *Store, stopCh <-chan struct{}) {
 	if store.redisClient == nil {
 		return
 	}
-	runningRequestsLivenessStarted.Store(true)
-	store.heartbeatRunningRequestsLiveness()
-	ticker := time.NewTicker(runningRequestsLivenessHeartbeatInterval)
-	go func() {
+	store.startOwnedTask(func() {
+		runningRequestsLivenessStarted.Store(true)
+		store.heartbeatRunningRequestsLiveness()
+		ticker := time.NewTicker(runningRequestsLivenessHeartbeatInterval)
 		defer ticker.Stop()
 		defer runningRequestsLivenessStarted.Store(false)
 		for {
@@ -510,7 +512,7 @@ func initRunningRequestsLiveness(store *Store, stopCh <-chan struct{}) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // redisNowMillis estimates the current time on Redis's clock (unix ms): this
@@ -636,7 +638,7 @@ func (c *Store) flushPendingRunningRequestsPrunes() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsWriteTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsWriteTimeout)
 	defer cancel()
 	client := c.redisClient
 	longLived, err := client.ZRangeByScore(ctx, runningRequestsGatewaysKey,
@@ -696,7 +698,7 @@ func (c *Store) readPodRunningRequests(namespace, name string) (count int64, ok 
 		return 0, false
 	}
 	key := runningRequestsKey(namespace, name)
-	ctx, cancel := context.WithTimeout(context.Background(), runningRequestsReadTimeout)
+	ctx, cancel := context.WithTimeout(c.runtimeContext(), runningRequestsReadTimeout)
 	defer cancel()
 	client := c.redisClient
 	pipe := client.Pipeline()

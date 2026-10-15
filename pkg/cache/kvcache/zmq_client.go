@@ -19,10 +19,14 @@ package kvcache
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/vllm-project/aibrix/pkg/utils"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	zmq "github.com/pebbe/zmq4"
 	"k8s.io/klog/v2"
@@ -61,7 +65,13 @@ type ZMQClient struct {
 
 // NewZMQClient creates a new ZMQ client for a vLLM pod
 func NewZMQClient(config *ZMQClientConfig, handler EventHandler) *ZMQClient {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewZMQClientWithContext(context.Background(), config, handler)
+}
+
+// NewZMQClientWithContext owns socket consumption under lifetime once Start
+// succeeds. Stop cancels and awaits that worker and closes its sockets.
+func NewZMQClientWithContext(lifetime context.Context, config *ZMQClientConfig, handler EventHandler) *ZMQClient {
+	ctx, cancel := context.WithCancel(lifetime)
 
 	return &ZMQClient{
 		config:         config,
@@ -75,8 +85,12 @@ func NewZMQClient(config *ZMQClientConfig, handler EventHandler) *ZMQClient {
 }
 
 // Connect establishes ZMQ connections
-func (c *ZMQClient) Connect() error {
-	c.mu.Lock()
+func (c *ZMQClient) Connect() error { return c.connectContext(c.ctx) }
+
+func (c *ZMQClient) connectContext(ctx context.Context) error {
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	if c.connected {
@@ -93,6 +107,7 @@ func (c *ZMQClient) Connect() error {
 	}
 
 	// Enable IPv6 for dual-stack support
+	_ = subSocket.SetLinger(0)
 	if err := subSocket.SetIpv6(true); err != nil {
 		_ = subSocket.Close()
 		return fmt.Errorf("failed to enable IPv6 on SUB socket: %w", err)
@@ -115,6 +130,7 @@ func (c *ZMQClient) Connect() error {
 	if err != nil {
 		_ = subSocket.Close()
 		return err
+
 	}
 
 	c.subSocket = subSocket
@@ -139,6 +155,7 @@ func (c *ZMQClient) newReplaySocket() (*zmq.Socket, error) {
 	}
 
 	// Enable IPv6 for dual-stack support
+	_ = replaySocket.SetLinger(0)
 	if err := replaySocket.SetIpv6(true); err != nil {
 		_ = replaySocket.Close()
 		return nil, fmt.Errorf("failed to enable IPv6 on DEALER socket: %w", err)
@@ -154,17 +171,25 @@ func (c *ZMQClient) newReplaySocket() (*zmq.Socket, error) {
 }
 
 // Start begins event consumption
-func (c *ZMQClient) Start() error {
-	if err := c.Connect(); err != nil {
+func (c *ZMQClient) Start() error { return c.StartWithContext(c.ctx) }
+
+// StartWithContext bounds connection/replay by ctx and returns cancellation
+// or connection errors. Replay errors are logged unless ctx ended. Continuing
+// consumption uses the constructor lifetime; call Stop even after setup failure.
+func (c *ZMQClient) StartWithContext(ctx context.Context) error {
+	if err := c.connectContext(ctx); err != nil {
 		return fmt.Errorf("initial connection failed: %w", err)
 	}
 
 	// Request full replay on startup
-	if err := c.requestReplay(0); err != nil {
+	if err := c.requestReplayContext(ctx, 0); err != nil {
 		klog.Warningf("Failed to request initial replay for %s: %v", c.config.PodKey, err)
 		// Don't fail startup if replay fails
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Start event consumption goroutine
 	c.wg.Add(1)
 	go c.consumeEventsWithReconnect()
@@ -287,7 +312,11 @@ func (c *ZMQClient) consumeEvents() error {
 			return nil
 		default:
 			// Poll with timeout
-			polled, err := poller.Poll(c.config.PollTimeout)
+			pollTimeout := c.config.PollTimeout
+			if pollTimeout <= 0 || pollTimeout > replayPollInterval {
+				pollTimeout = replayPollInterval
+			}
+			polled, err := poller.Poll(pollTimeout)
 			if err != nil {
 				return fmt.Errorf("poll error: %w", err)
 			}
@@ -316,20 +345,14 @@ func (c *ZMQClient) processMessage() error {
 	}
 
 	// Receive multipart message: [topic, sequence, payload]
-	topic, err := socket.RecvBytes(0)
+	frames, err := socket.RecvMessageBytes(zmq.DONTWAIT)
 	if err != nil {
-		return fmt.Errorf("failed to receive topic: %w", err)
+		return fmt.Errorf("failed to receive event: %w", err)
 	}
-
-	seqBytes, err := socket.RecvBytes(0)
-	if err != nil {
-		return fmt.Errorf("failed to receive sequence: %w", err)
+	if len(frames) != 3 {
+		return fmt.Errorf("invalid event frame count: %d", len(frames))
 	}
-
-	payload, err := socket.RecvBytes(0)
-	if err != nil {
-		return fmt.Errorf("failed to receive payload: %w", err)
-	}
+	topic, seqBytes, payload := frames[0], frames[1], frames[2]
 
 	// Parse sequence number
 	if len(seqBytes) != 8 {
@@ -374,6 +397,9 @@ func (c *ZMQClient) applyEventBatch(seq int64, payload []byte) (int, error) {
 
 	// Process each event
 	for _, event := range batch.Events {
+		if err := c.ctx.Err(); err != nil {
+			return 0, err
+		}
 		// Handle the event
 		startTime := time.Now()
 		if err := c.eventHandler.HandleEvent(event); err != nil {
@@ -397,29 +423,40 @@ func (c *ZMQClient) applyEventBatch(seq int64, payload []byte) (int, error) {
 // on and applies them. vLLM's ZmqEventPublisher._service_replay answers with
 // one message per buffered batch with sequence >= fromSeq, then an end marker
 // with sequence END_SEQ (-1).
-func (c *ZMQClient) requestReplay(fromSeq int64) error {
-	c.mu.RLock()
+func (c *ZMQClient) requestReplay(fromSeq int64) error { return c.requestReplayContext(c.ctx, fromSeq) }
+
+const replayPollInterval = 10 * time.Millisecond
+
+func (c *ZMQClient) requestReplayContext(parent context.Context, fromSeq int64) error {
+	ctx, cancel := context.WithTimeout(parent, c.config.ReplayTimeout)
+	defer cancel()
+	if err := utils.LockContext(ctx, c.mu.TryRLock, c.mu.RUnlock); err != nil {
+		return err
+	}
+
 	socket := c.replaySocket
 	c.mu.RUnlock()
-
 	if socket == nil {
 		return fmt.Errorf("replay socket is nil")
 	}
-
-	// Prepare replay request
-	// DEALER-ROUTER pattern requires: [empty_delimiter, payload]
-	// The DEALER socket will automatically prepend the identity frame
-	reqData := make([]byte, 8)
-	binary.BigEndian.PutUint64(reqData, uint64(fromSeq))
-
-	// Send replay request as multipart message: [empty_delimiter, start_seq_bytes]
-	if _, err := socket.SendMessage([]byte{}, reqData); err != nil {
-		c.metrics.IncrementReplayFailure()
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(fromSeq))
+	err := wait.PollUntilContextCancel(ctx, replayPollInterval, true, func(context.Context) (bool, error) {
+		_, sendErr := socket.SendMessageDontwait([]byte{}, data)
+		if sendErr == nil {
+			return true, nil
+		}
+		if zmq.AsErrno(sendErr) == zmq.Errno(syscall.EAGAIN) {
+			return false, nil
+		}
+		return false, sendErr
+	})
+	if err != nil {
 		return fmt.Errorf("failed to send replay request: %w", err)
 	}
 	c.metrics.IncrementReplayCount()
+	applied, err := c.receiveReplayContext(ctx, socket)
 
-	applied, err := c.receiveReplay(socket)
 	if err != nil {
 		c.metrics.IncrementReplayFailure()
 		// The rest of this reply can still arrive. Replace the socket so that
@@ -430,6 +467,7 @@ func (c *ZMQClient) requestReplay(fromSeq int64) error {
 
 	klog.Infof("Replayed %d event batches from seq %d for %s", applied, fromSeq, c.config.PodKey)
 	c.metrics.IncrementReplaySuccess()
+
 	return nil
 }
 
@@ -437,24 +475,32 @@ func (c *ZMQClient) requestReplay(fromSeq int64) error {
 // batch newer than lastSeq, in order. The whole reply must arrive within
 // ReplayTimeout. It returns the number of batches applied.
 func (c *ZMQClient) receiveReplay(socket *zmq.Socket) (int, error) {
-	deadline := time.Now().Add(c.config.ReplayTimeout)
+	ctx, cancel := context.WithTimeout(c.ctx, c.config.ReplayTimeout)
+	defer cancel()
+	return c.receiveReplayContext(ctx, socket)
+}
+
+func (c *ZMQClient) receiveReplayContext(ctx context.Context, socket *zmq.Socket) (int, error) {
 	applied := 0
 
 	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return applied, fmt.Errorf("timed out after %v waiting for the end of the replay",
-				c.config.ReplayTimeout)
-		}
-		_ = socket.SetRcvtimeo(remaining)
-
-		frames, err := socket.RecvMessageBytes(0)
-		if err != nil {
-			if zmq.AsErrno(err) == zmq.Errno(syscall.EAGAIN) {
-				// Receive timeout; the deadline check above reports it
-				continue
+		var frames [][]byte
+		err := wait.PollUntilContextCancel(ctx, replayPollInterval, true, func(context.Context) (bool, error) {
+			var err error
+			frames, err = socket.RecvMessageBytes(zmq.DONTWAIT)
+			if err == nil {
+				return true, nil
 			}
-			return applied, fmt.Errorf("failed to receive replay message: %w", err)
+			if zmq.AsErrno(err) == zmq.Errno(syscall.EAGAIN) {
+				return false, nil
+			}
+			return false, err
+		})
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return applied, fmt.Errorf("receive replay message timed out: %w", err)
+			}
+			return applied, fmt.Errorf("receive replay message: %w", err)
 		}
 
 		// vLLM v0.26 and later send [empty_delimiter, topic, sequence, payload];

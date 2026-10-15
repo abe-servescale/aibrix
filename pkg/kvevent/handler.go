@@ -25,6 +25,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/vllm-project/aibrix/pkg/cache/kvcache"
+	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 // eventHandler implements kvcache.EventHandler interface
@@ -38,7 +39,9 @@ type eventHandler struct {
 // HandleEvent processes KV cache events
 func (h *eventHandler) HandleEvent(event kvcache.KVEvent) error {
 	// Check if manager is stopped before using its context
-	h.manager.mu.RLock()
+	if err := utils.LockContext(h.manager.ctx, h.manager.mu.TryRLock, h.manager.mu.RUnlock); err != nil {
+		return err
+	}
 	stopped := h.manager.stopped
 	h.manager.mu.RUnlock()
 

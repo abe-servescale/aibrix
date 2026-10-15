@@ -17,6 +17,7 @@ limitations under the License.
 package prefixcache
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -72,6 +73,10 @@ type histogramEntry struct {
 }
 
 type prefixCacheAndLoadRouter struct {
+	lifetime context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+
 	cache          *prefixcacheindexer.LPRadixCache
 	metricCache    cache.Cache
 	histogram      *SlidingWindowHistogram
@@ -234,6 +239,15 @@ func (h *SlidingWindowHistogram) getPrefillCost(node *prefixcacheindexer.TreeNod
 }
 
 func NewPrefixCacheAndLoadRouter() (types.Router, error) {
+	return NewPrefixCacheAndLoadRouterWithContext(context.Background(), context.Background())
+}
+
+// NewPrefixCacheAndLoadRouterWithContext rejects canceled startup and owns
+// eviction under lifetime. Call Cleanup to cancel and await its worker.
+func NewPrefixCacheAndLoadRouterWithContext(startup, lifetime context.Context) (types.Router, error) {
+	if err := startup.Err(); err != nil {
+		return nil, err
+	}
 	metricCache, err := cache.Get()
 	if err != nil {
 		klog.Error("fail to get cache store in prefix-cache-preble router")
@@ -254,7 +268,9 @@ func NewPrefixCacheAndLoadRouter() (types.Router, error) {
 		avgTimePerTokenPerPod:      make(map[string][]float64),
 	}
 
+	run, cancel := context.WithCancel(lifetime)
 	router := &prefixCacheAndLoadRouter{
+		lifetime: run, cancel: cancel, done: make(chan struct{}),
 		cache:          prefixcacheindexer.NewLPRadixCache(numPods),
 		metricCache:    metricCache,
 		histogram:      histogram,
@@ -269,7 +285,13 @@ func NewPrefixCacheAndLoadRouter() (types.Router, error) {
 }
 
 func (h *SlidingWindowHistogram) removeEvictedNodes(nodes []*prefixcacheindexer.TreeNode) {
-	h.mu.Lock()
+	h.removeEvictedNodesContext(context.Background(), nodes)
+}
+
+func (h *SlidingWindowHistogram) removeEvictedNodesContext(ctx context.Context, nodes []*prefixcacheindexer.TreeNode) {
+	if err := utils.LockContext(ctx, h.mu.TryLock, h.mu.Unlock); err != nil {
+		return
+	}
 	defer h.mu.Unlock()
 
 	// Create a map for faster lookup
@@ -299,7 +321,13 @@ func (h *SlidingWindowHistogram) removeEvictedNodes(nodes []*prefixcacheindexer.
 }
 
 func (h *SlidingWindowHistogram) removeOldEntries(currentTime time.Time) {
-	h.mu.Lock()
+	h.removeOldEntriesContext(context.Background(), currentTime)
+}
+
+func (h *SlidingWindowHistogram) removeOldEntriesContext(ctx context.Context, currentTime time.Time) {
+	if err := utils.LockContext(ctx, h.mu.TryLock, h.mu.Unlock); err != nil {
+		return
+	}
 	defer h.mu.Unlock()
 	windowStart := currentTime.Add(-h.windowDuration)
 	newTimestamps := make([]histogramEntry, 0)
@@ -328,14 +356,26 @@ func (h *SlidingWindowHistogram) removeOldEntries(currentTime time.Time) {
 
 func (p *prefixCacheAndLoadRouter) evictionLoop() {
 	ticker := time.NewTicker(evictionLoopInterval)
-	for range ticker.C {
-		evictedNodes := p.cache.Evict(time.Now())
-		if len(evictedNodes) > 0 {
-			p.histogram.removeEvictedNodes(evictedNodes)
+	defer ticker.Stop()
+	defer close(p.done)
+	for {
+		select {
+		case <-p.lifetime.Done():
+			return
+		case <-ticker.C:
 		}
-		p.histogram.removeOldEntries(time.Now())
+		evictedNodes, err := p.cache.EvictContext(p.lifetime, time.Now())
+		if err != nil {
+			return
+		}
+		if len(evictedNodes) > 0 {
+			p.histogram.removeEvictedNodesContext(p.lifetime, evictedNodes)
+		}
+		p.histogram.removeOldEntriesContext(p.lifetime, time.Now())
 	}
 }
+
+func (p *prefixCacheAndLoadRouter) Cleanup() error { p.cancel(); <-p.done; return nil }
 
 func (h *SlidingWindowHistogram) getSimplePrefillCost(node *prefixcacheindexer.TreeNode) float64 {
 	missRate := 1.0

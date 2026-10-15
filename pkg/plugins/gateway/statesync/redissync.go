@@ -79,6 +79,9 @@ type RedisSync struct {
 	stopCh          chan struct{}
 	stopOnce        sync.Once
 	loopWg          sync.WaitGroup
+	lifetime        context.Context
+	cancel          context.CancelFunc
+	managed         bool
 }
 
 // Option configures RedisSync.
@@ -447,30 +450,28 @@ func (r *RedisSync) pushFull(ctx context.Context, namespace string, s syncable.S
 // Start starts the background goroutine: optional initial sync (with small random
 // delay), then periodic Pull-first then optional Push, with jitter and backoff on errors.
 // Register must be called before Start.
-func (r *RedisSync) Start() {
+func (r *RedisSync) Start() { r.start(context.Background(), false) }
+
+// StartWithContext owns the sync loop and in-flight operations under ctx.
+// Stop cancels and awaits this managed loop without abandoning a waiter.
+func (r *RedisSync) StartWithContext(ctx context.Context) { r.start(ctx, true) }
+
+func (r *RedisSync) start(ctx context.Context, managed bool) {
 	r.startedMu.Lock()
+	defer r.startedMu.Unlock()
 	if r.started {
-		r.startedMu.Unlock()
 		return
 	}
+	select {
+	case <-r.stopCh:
+		return
+	default:
+	}
 	r.started = true
-	r.startedMu.Unlock()
-	klog.InfoS("redissync started", "syncPeriod", r.syncPeriod, "syncables", len(r.syncables))
+	r.managed = managed
+	r.lifetime, r.cancel = context.WithCancel(ctx)
 	r.loopWg.Add(1)
-	go func() {
-		defer r.loopWg.Done()
-		r.syncLoop()
-	}()
-}
-
-// StartWithContext starts the sync loop and binds it to the provided context.
-// When ctx is canceled, Stop() is invoked.
-func (r *RedisSync) StartWithContext(ctx context.Context) {
-	go func() {
-		<-ctx.Done()
-		r.Stop()
-	}()
-	r.Start()
+	go func() { defer r.loopWg.Done(); r.syncLoop() }()
 }
 
 // syncLoop runs: initial random delay, one immediate Pull (and optional Push),
@@ -479,7 +480,7 @@ func (r *RedisSync) syncLoop() {
 	// Initial random delay to spread out load on startup across replicas.
 	if jitterRange := int64(r.syncPeriod) / 2; jitterRange > 0 {
 		select {
-		case <-r.stopCh:
+		case <-r.lifetime.Done():
 			return
 		case <-time.After(time.Duration(rand.Int63n(jitterRange))):
 		}
@@ -504,7 +505,7 @@ func (r *RedisSync) syncLoop() {
 			interval = r.syncPeriod / 2
 		}
 		select {
-		case <-r.stopCh:
+		case <-r.lifetime.Done():
 			return
 		case <-time.After(interval):
 		}
@@ -524,7 +525,11 @@ func (r *RedisSync) syncLoop() {
 // runOneSyncCycle runs Pull first for all Syncables, then optional Push. Pull-before-Push
 // reduces overwrites. Uses opTimeout for the cycle.
 func (r *RedisSync) runOneSyncCycle() error {
-	ctx, cancel := context.WithTimeout(context.Background(), r.opTimeout)
+	lifetime := r.lifetime
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(lifetime, r.opTimeout)
 	defer cancel()
 	var lastErr error
 	for _, s := range r.syncables {
@@ -547,6 +552,17 @@ func (r *RedisSync) runOneSyncCycle() error {
 // for the loop goroutine if Start was used.
 func (r *RedisSync) Stop() {
 	r.stopOnce.Do(func() { close(r.stopCh) })
+	r.startedMu.Lock()
+	cancel, managed := r.cancel, r.managed
+	r.startedMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if managed {
+		r.loopWg.Wait()
+		return
+	}
+
 	wait := r.stopWaitTimeout
 	if wait <= 0 {
 		wait = defaultStopWaitTimeout

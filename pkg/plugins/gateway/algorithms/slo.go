@@ -16,6 +16,8 @@ limitations under the License.
 package routingalgorithms
 
 import (
+	"context"
+
 	"github.com/vllm-project/aibrix/pkg/cache"
 	"github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms/least"
 	"github.com/vllm-project/aibrix/pkg/plugins/gateway/queue"
@@ -74,6 +76,23 @@ func NewSLORouter(modelName string) (types.QueueRouter, error) {
 		return nil, err
 	}
 
+	c, err := cache.Get()
+	if err != nil {
+		return nil, err
+	}
+	return newSLORouterWithContext(context.Background(), context.Background(), c, loadProvider, modelName)
+}
+
+// NewSLORouterWithContext bounds construction by startup and owns its queue
+// under lifetime. All dependencies use st before singleton publication.
+func NewSLORouterWithContext(startup, lifetime context.Context, st *cache.Store, modelName string) (types.QueueRouter, error) {
+	return newSLORouterWithContext(startup, lifetime, st, cache.NewPendingLoadProviderWithCache(st), modelName)
+}
+
+func newSLORouterWithContext(startup, lifetime context.Context, c cache.Cache, loadProvider *cache.PendingLoadProvider, modelName string) (types.QueueRouter, error) {
+	if err := startup.Err(); err != nil {
+		return nil, err
+	}
 	// Each SLORouter instance owns a private RouterManager for its internal sub-routing.
 	// We intentionally use this local rm — not defaultRM — for SetFallback below.
 	//
@@ -94,20 +113,23 @@ func NewSLORouter(modelName string) (types.QueueRouter, error) {
 	defaultProvider := func(_ *types.RoutingContext) (types.Router, error) { return defaultRouter, nil }
 	rm.RegisterProvider(RouterSLO, defaultProvider)
 	rm.RegisterProvider(RouterSLOLeastLoadPulling, defaultProvider)
-	rm.Register(RouterSLOPackLoad, func() (types.Router, error) { return NewPackLoadRouter(loadProvider) })
-	rm.Register(RouterSLOLeastLoad, func() (types.Router, error) { return least.NewLeastLoadRouter(loadProvider) })
+	rm.registerLocal(RouterSLOPackLoad, func() (types.Router, error) { return NewPackLoadRouter(loadProvider) })
+	rm.registerLocal(RouterSLOLeastLoad, func() (types.Router, error) { return least.NewLeastLoadRouter(loadProvider) })
 	// RouterLeastRequest must be registered on the local rm because rm.SetFallback
 	// resolves the provider from rm.routerFactory, populated by rm.Init() below.
-	rm.Register(RouterLeastRequest, least.NewLeastRequestTopKRouter)
-	rm.Init()
+	rm.registerLocal(RouterLeastRequest, func() (types.Router, error) { return least.NewLeastRequestTopKRouterWithCache(c), nil })
+	if err := rm.InitWithLifetimeContext(startup, lifetime); err != nil {
 
-	sloQueue, err := queue.NewSLOQueue(rm.Select, modelName)
-	if err != nil {
 		return nil, err
 	}
+
+	sloQueue := queue.NewSLOQueueWithCache(rm.Select, modelName, c)
 	router := &SLORouter{SLOQueue: sloQueue}
-	if err := rm.SetFallback(router, RouterLeastRequest); err != nil {
+	if err := rm.SetFallbackContext(startup, router, RouterLeastRequest); err != nil {
 		return nil, err
 	}
-	return NewQueueRouter(router, sloQueue)
+	if err := startup.Err(); err != nil {
+		return nil, err
+	}
+	return NewQueueRouterWithContext(lifetime, router, sloQueue, c)
 }

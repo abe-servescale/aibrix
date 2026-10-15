@@ -26,17 +26,23 @@ import (
 // sources match a recent Kubernetes snapshot. Static discovery has no
 // continuing watch and uses its loaded configuration directly.
 func (c *Store) ListModelsVerified(ctx context.Context, readyPods bool) ([]string, error) {
-	list := c.ListModels
-	if readyPods {
-		list = c.ListModelsWithReadyPods
+	if c.lifetimeCtx != nil {
+		operation, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(c.lifetimeCtx, cancel)
+		defer func() { stop(); cancel() }()
+		ctx = operation
 	}
+	list := func(ctx context.Context) ([]string, error) { return c.ListModelsContext(ctx, readyPods) }
 	if c.modelListHealth == nil {
-		return list(), nil
+		return list(ctx)
 	}
 	if err := c.modelListHealth.EnsureVerified(ctx); err != nil {
 		return nil, err
 	}
-	models, ok := c.modelListHealth.ModelsIfHealthy(list)
+	models, ok, err := c.modelListHealth.ModelsIfHealthyContext(ctx, list)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, discovery.ErrModelListDiscoveryUnavailable
 	}
