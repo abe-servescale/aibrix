@@ -59,7 +59,11 @@ func OTELEnabled() bool {
 }
 
 func InitOpenTelemetry(serviceName string, protocol string) (*Telemetry, error) {
-	ctx := context.Background()
+	return InitOpenTelemetryWithContext(context.Background(), serviceName, protocol)
+}
+
+// InitOpenTelemetryWithContext bounds exporter setup by the gateway startup context.
+func InitOpenTelemetryWithContext(ctx context.Context, serviceName string, protocol string) (*Telemetry, error) {
 
 	exporter, err := newExporter(ctx, protocol)
 	if err != nil {

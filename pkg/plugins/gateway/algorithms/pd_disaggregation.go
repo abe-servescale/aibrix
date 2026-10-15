@@ -17,6 +17,7 @@ limitations under the License.
 package routingalgorithms
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -125,7 +126,22 @@ var validPrefillScorePolicies = []string{
 }
 
 func init() {
-	Register(RouterPD, NewPDRouter)
+	RegisterContext(RouterPD, func(startup, lifetime context.Context) (types.Router, error) {
+		c, err := cache.Get()
+		if err != nil {
+			return nil, err
+		}
+		indexer := prefixcacheindexer.GetSharedPrefixHashTableWithContext(lifetime)
+		router, err := NewPDRouterWithContext(startup, lifetime, c, indexer)
+		if err != nil {
+			if lifetime.Done() != nil {
+				indexer.Close()
+			}
+			return nil, err
+		}
+		router.(*pdRouter).ownsPrefixIndexer = lifetime.Done() != nil
+		return router, nil
+	})
 	// Point the vLLM engine handler at the live connector-type var so that tests
 	// (and runtime config changes via env) are reflected without a second copy.
 	engine.SetConnectorTypeFunc(func() string { return aibrixKVConnectorType })
@@ -283,7 +299,12 @@ type pdRouter struct {
 	// Tokenization and prefix matching (PrefillScorePolicy.Prepare) depend
 	// only on the request and run before the lock is taken. countersMu is
 	// taken inside selectMu (in finalPDScore) and never the other way round.
-	selectMu sync.Mutex
+	selectMu          sync.Mutex
+	tasks             *utils.OwnedTasks
+	transport         *http.Transport
+	ownsPrefixIndexer bool
+	closeOnce         sync.Once
+	closeLedger       func()
 }
 
 type bucketServeMetricObserver struct {
@@ -318,13 +339,35 @@ func NewPDRouter() (types.Router, error) {
 // "pd" without initialising the global cache. A nil sharedPrefixTable gets a
 // fresh table.
 func NewPDRouterWithCacheAndPrefixIndexer(c cache.Cache, sharedPrefixTable *prefixcacheindexer.PrefixHashTable) (types.Router, error) {
+	return NewPDRouterWithContext(context.Background(), context.Background(), c, sharedPrefixTable)
+}
+
+// NewPDRouterWithContext bounds setup by startup and owns continuing PD work
+// under lifetime. Cleanup cancels and awaits it, including detached requests.
+// A supplied prefix table remains caller-owned; a nil one is router-owned.
+func NewPDRouterWithContext(startup, lifetime context.Context, c cache.Cache, sharedPrefixTable *prefixcacheindexer.PrefixHashTable) (types.Router, error) {
+	if err := startup.Err(); err != nil {
+		return nil, err
+	}
+	tasks := utils.NewOwnedTasks(lifetime)
+	ownsIndexer := sharedPrefixTable == nil
 	if sharedPrefixTable == nil {
-		sharedPrefixTable = prefixcacheindexer.NewPrefixHashTable()
+		sharedPrefixTable = prefixcacheindexer.NewPrefixHashTableWithContext(tasks.Context())
 	}
 	// One tracker per router, created unconditionally so that a routingConfig
 	// can switch a model to token_load or hybrid_cache_load without a gateway
 	// restart.
-	tokenLoadTracker := pd.NewTokenLoadTracker()
+	tokenLoadTracker := pd.NewTokenLoadTrackerWithContext(tasks.Context(), pd.DefaultTokenLoadConfig())
+	success := false
+	defer func() {
+		if !success {
+			tasks.Close()
+			tokenLoadTracker.Close()
+			if ownsIndexer {
+				sharedPrefixTable.Close()
+			}
+		}
+	}()
 	// The bucket-serve planner is unconditional for the same reason: its
 	// configuration comes from each request's resolved knobs.
 	bucketServeTracker := pd.NewBucketServeTracker()
@@ -387,7 +430,7 @@ func NewPDRouterWithCacheAndPrefixIndexer(c cache.Cache, sharedPrefixTable *pref
 	}
 	// NewTRTLLMHandler now fails only for generation_first without a provider,
 	// which is a programming error and must still fail construction.
-	trtHandler, err := engine.NewTRTLLMHandler(trtScheduleStyle, engine.NewTRTServerInfoCache(httpClient))
+	trtHandler, err := engine.NewTRTLLMHandler(trtScheduleStyle, engine.NewTRTServerInfoCacheWithOwner(httpClient, tasks))
 	if err != nil {
 		return nil, err
 	}
@@ -405,6 +448,9 @@ func NewPDRouterWithCacheAndPrefixIndexer(c cache.Cache, sharedPrefixTable *pref
 		httpClient:            httpClient,
 		prefixUpdateCh:        make(chan prefixUpdateJob, 1024),
 		selectionCounts:       make(map[string]int64),
+		tasks:                 tasks,
+		transport:             transport,
+		ownsPrefixIndexer:     ownsIndexer,
 	}
 	r.podSelector = selector.NewDefaultSelector(r.filterPrefillDecodePods)
 	r.prefillExecutor = prefill.NewDefaultExecutor(httpClient, r.prefillRequestTracker,
@@ -415,7 +461,35 @@ func NewPDRouterWithCacheAndPrefixIndexer(c cache.Cache, sharedPrefixTable *pref
 	r.shareDecodeLedger()
 
 	r.startPrefixUpdater()
+	if err := startup.Err(); err != nil {
+		_ = r.Cleanup()
+		return nil, err
+	}
+	success = true
 	return r, nil
+}
+
+// Cleanup cancels and awaits all PD work, then releases its transports and
+// router-owned indexes. Cached tracker state remains readable afterward.
+func (r *pdRouter) Cleanup() error {
+	r.closeOnce.Do(func() {
+		if r.tasks != nil {
+			r.tasks.Close()
+		}
+		if r.tokenLoadTracker != nil {
+			r.tokenLoadTracker.Close()
+		}
+		if r.closeLedger != nil {
+			r.closeLedger()
+		}
+		if r.transport != nil {
+			r.transport.CloseIdleConnections()
+		}
+		if r.ownsPrefixIndexer && r.prefixCacheIndexer != nil {
+			r.prefixCacheIndexer.Close()
+		}
+	})
+	return nil
 }
 
 // AddRequestCount implements cache.RequestTracker. The pd router charges its
@@ -502,6 +576,10 @@ func (r *pdRouter) releaseTokenLoad(requestID string) {
 }
 
 func (r *pdRouter) Route(ctx *types.RoutingContext, readyPodList types.PodList) (string, error) {
+	if r.tasks != nil {
+		ctx.Context = utils.WithTaskOwner(ctx.Context, r.tasks)
+		ctx.PDLeg().SetTaskContext(ctx.Context)
+	}
 	// Park the request's resolved PD overrides on its leg before anything can
 	// read them: selection reads them through the routing context, and the
 	// async prefill leg, including the decode abort it may start, reads them
@@ -1470,11 +1548,19 @@ type prefixUpdateJob struct {
 
 func (r *pdRouter) startPrefixUpdater() {
 	// single worker to serialize updates, minimizing lock contention in the indexer
-	go func() {
-		for job := range r.prefixUpdateCh {
-			r.prefixCacheIndexer.AddPrefix(job.prefixHashes, job.model, job.pod)
+	r.tasks.Start(func() {
+		for {
+			select {
+			case <-r.tasks.Context().Done():
+				return
+			case job, ok := <-r.prefixUpdateCh:
+				if !ok {
+					return
+				}
+				_ = r.prefixCacheIndexer.AddPrefixContext(r.tasks.Context(), job.prefixHashes, job.model, job.pod)
+			}
 		}
-	}()
+	})
 }
 
 func (r *pdRouter) enqueuePrefixUpdate(prefixHashes []uint64, model, pod string) {
@@ -1745,10 +1831,21 @@ func (r *pdRouter) shareDecodeLedger() {
 		return
 	}
 	tracker := r.tokenLoadTracker
-	notify := shared.PublishDecodeLedger(func(podKey string) cache.DecodeLedgerState {
+	provider := func(podKey string) cache.DecodeLedgerState {
 		tokens, charges, sumChargedAt := tracker.DecodeLedgerState(podKey)
 		return cache.DecodeLedgerState{Tokens: tokens, Charges: charges, SumChargedAt: sumChargedAt}
-	})
+	}
+	var notify func(string)
+	if managed, ok := r.cache.(interface {
+		PublishDecodeLedgerWithContext(context.Context, cache.ContextDecodeLedgerProvider) (func(string), func())
+	}); ok && r.tasks != nil {
+		notify, r.closeLedger = managed.PublishDecodeLedgerWithContext(r.tasks.Context(), func(ctx context.Context, podKey string) (cache.DecodeLedgerState, error) {
+			tokens, charges, sumChargedAt, err := tracker.DecodeLedgerStateContext(ctx, podKey)
+			return cache.DecodeLedgerState{Tokens: tokens, Charges: charges, SumChargedAt: sumChargedAt}, err
+		})
+	} else {
+		notify = shared.PublishDecodeLedger(provider)
+	}
 	tracker.SetDecodeLedgerListener(notify)
 	r.sharedDecodeLedger = shared
 	klog.InfoS("pd_router token_load decode ledger is shared across gateway replicas")

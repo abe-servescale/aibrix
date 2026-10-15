@@ -7,6 +7,7 @@ namePrefix: aibrix-
 
 resources:
 - ../../../gateway/gateway-plugin
+- ../../../rbac/gateway
 
 images:
 - name: gateway-plugins
@@ -25,6 +26,7 @@ patches:
           containers:
             - name: gateway-plugin
               args:
+                - --installation-namespace=default
                 - -v=5
               env:
                 - name: AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS
@@ -36,3 +38,6 @@ patches:
     name: gateway-plugins
     namespace: system
     version: v1
+
+transformers:
+- ../../../gateway/discovery-namespace/transformer

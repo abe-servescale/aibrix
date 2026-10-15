@@ -1,78 +1,134 @@
 {{- if or .Values.gateway.enable .Values.gateway.envoyAsSideCar }}
----
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
   annotations:
     {{- toYaml .Values.gatewayPlugin.serviceAccount.annotations | nindent 4 }}
   labels:
     {{- include "aibrix.labels" . | nindent 4 }}
     app.kubernetes.io/component: aibrix-gateway-plugin
 ---
-
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-discovery
+  namespace: {{ include "aibrix.gatewayPlugin.installationNamespace" . | quote }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list", "watch"]
+- apiGroups: ["model.aibrix.ai"]
+  resources: ["modeladapters", "modelclaims"]
+  verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-discovery
+  namespace: {{ include "aibrix.gatewayPlugin.installationNamespace" . | quote }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "aibrix.fullname" . }}-gateway-discovery
+subjects:
+- kind: ServiceAccount
+  name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "aibrix.fullname" . }}-gateway-plugins
+  name: {{ include "aibrix.fullname" . }}-gateway-installation-namespace
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - model.aibrix.ai
-  resources:
-  - modeladapters
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - model.aibrix.ai
-  resources:
-  - modelclaims
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - gateway.networking.k8s.io
-  resources:
-  - httproutes
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
+- apiGroups: [""]
+  resources: ["namespaces"]
+  resourceNames: [{{ include "aibrix.gatewayPlugin.installationNamespace" . | quote }}]
+  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-installation-namespace
   labels:
     {{- include "aibrix.labels" . | nindent 4 }}
-  name: {{ include "aibrix.fullname" . }}-gateway-plugins
+    app.kubernetes.io/component: aibrix-gateway-plugin
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "aibrix.fullname" . }}-gateway-plugins
+  name: {{ include "aibrix.fullname" . }}-gateway-installation-namespace
 subjects:
-  - kind: ServiceAccount
-    name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
+- kind: ServiceAccount
+  name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-request-access
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["httproutes"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-request-access
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "aibrix.fullname" . }}-gateway-request-access
+subjects:
+- kind: ServiceAccount
+  name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-pod-wake
+  namespace: {{ include "aibrix.gatewayPlugin.installationNamespace" . | quote }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "aibrix.fullname" . }}-gateway-pod-wake
+  namespace: {{ include "aibrix.gatewayPlugin.installationNamespace" . | quote }}
+  labels:
+    {{- include "aibrix.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aibrix-gateway-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "aibrix.fullname" . }}-gateway-pod-wake
+subjects:
+- kind: ServiceAccount
+  name: {{ include "aibrix.gatewayPlugin.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
 {{- end }}

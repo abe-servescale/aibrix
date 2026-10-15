@@ -16,27 +16,22 @@ limitations under the License.
 package cache
 
 import (
-	"errors"
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	crdinformers "github.com/vllm-project/aibrix/pkg/client/informers/externalversions"
+	"github.com/vllm-project/aibrix/pkg/cache/discovery"
 	"github.com/vllm-project/aibrix/pkg/constants"
 	"github.com/vllm-project/aibrix/pkg/utils"
 	atomic_ext "go.uber.org/atomic"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
-	v1alpha1 "github.com/vllm-project/aibrix/pkg/client/clientset/versioned"
-	v1alpha1scheme "github.com/vllm-project/aibrix/pkg/client/clientset/versioned/scheme"
-	"k8s.io/client-go/kubernetes/scheme"
 )
 
 const (
@@ -50,59 +45,6 @@ var (
 	modelAdapterResyncMaxRetries    = 30
 	modelAdapterResyncRetryInterval = 1 * time.Second
 )
-
-func initCacheInformers(instance *Store, config *rest.Config, stopCh <-chan struct{}) error {
-	if err := v1alpha1scheme.AddToScheme(scheme.Scheme); err != nil {
-		return err
-	}
-
-	k8sClientSet, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	crdClientSet, err := v1alpha1.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	factory := informers.NewSharedInformerFactoryWithOptions(k8sClientSet, 0)
-	crdFactory := crdinformers.NewSharedInformerFactoryWithOptions(crdClientSet, 0)
-
-	podInformer := factory.Core().V1().Pods().Informer()
-	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    instance.addPod,
-		UpdateFunc: instance.updatePod,
-		DeleteFunc: instance.deletePod,
-	}); err != nil {
-		return err
-	}
-
-	modelInformer := crdFactory.Model().V1alpha1().ModelAdapters().Informer()
-	if _, err = modelInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    instance.addModelAdapter,
-		UpdateFunc: instance.updateModelAdapter,
-		DeleteFunc: instance.deleteModelAdapter,
-	}); err != nil {
-		return err
-	}
-
-	factory.Start(stopCh)
-	crdFactory.Start(stopCh)
-
-	if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced, modelInformer.HasSynced) {
-		return errors.New("timed out waiting for caches to sync")
-	}
-
-	// After cache sync, resync all ModelAdapters to ensure pod mappings are correct
-	// This handles the case where ModelAdapters were processed before their pods were cached
-	instance.resyncModelAdapters(modelInformer.GetStore(), stopCh)
-
-	// Log cache state after initialization
-	klog.Infof("Cache initialization completed. Models: %v", instance.ListModels())
-
-	return nil
-}
 
 // getModelNameFromPod retrieves model name from pod labels first, then annotations.
 // This supports cases where model names contain characters invalid for K8s labels (e.g., '/').
@@ -118,6 +60,20 @@ func (c *Store) modelClaimBindingsFromPod(pod *v1.Pod) map[string]utils.ModelCla
 }
 
 func (c *Store) addPod(obj interface{}) {
+	if err := c.addPodContext(context.Background(), obj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "addPod")
+	}
+	_ = c.notifyKVEvent(context.Background(), discovery.WatchEvent{Type: discovery.EventAdd, Object: obj})
+}
+
+func (c *Store) addPodContext(ctx context.Context, obj interface{}) (err error) {
+	if err = c.prepareEventRouters(ctx, discovery.WatchEvent{Type: discovery.EventAdd, Object: obj}); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	pod := obj.(*v1.Pod)
 	// Track pods that serve a model either through the standard deployment label
 	// or through ModelClaim runtime annotations.
@@ -125,26 +81,41 @@ func (c *Store) addPod(obj interface{}) {
 	modelClaims := c.modelClaimBindingsFromPod(pod)
 	if !ok && len(modelClaims) == 0 {
 		klog.V(4).InfoS("ignored pod without model label or annotation", "name", pod.Name)
-		return
+		return err
 	}
 
 	// ignore worker pod
 	if isWorkerPod(pod) {
-		return
+		return err
 	}
 
-	c.mu.Lock()
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
-	metaPod := c.addPodLocked(pod)
+	metaPod, err := c.addPodLockedContext(ctx, pod)
+
+	if err != nil {
+		return err
+	}
 	if ok {
-		c.addPodAndModelMappingLocked(metaPod, modelName)
+		if err = c.addPodAndModelMappingLockedContext(ctx, metaPod, modelName); err != nil {
+			return err
+		}
 	}
 	podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
 	for servedModel, binding := range modelClaims {
-		c.modelClaims.set(podKey, servedModel, binding)
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if err = c.modelClaims.setContext(ctx, podKey, servedModel, binding); err != nil {
+			return err
+		}
 		if binding.Port > 0 {
-			c.addPodAndModelMappingLocked(metaPod, servedModel)
+			if err = c.addPodAndModelMappingLockedContext(ctx, metaPod, servedModel); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -152,12 +123,25 @@ func (c *Store) addPod(obj interface{}) {
 	c.debugInfo()
 
 	// Notify KV event manager
-	if c.kvEventManager != nil {
-		c.kvEventManager.OnPodAdd(pod)
-	}
+
+	return ctx.Err()
 }
 
 func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
+	if err := c.updatePodContext(context.Background(), oldObj, newObj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "updatePod")
+	}
+	_ = c.notifyKVEvent(context.Background(), discovery.WatchEvent{Type: discovery.EventUpdate, Object: newObj, OldObject: oldObj})
+}
+
+func (c *Store) updatePodContext(ctx context.Context, oldObj interface{}, newObj interface{}) (err error) {
+	if err = c.prepareEventRouters(ctx, discovery.WatchEvent{Type: discovery.EventUpdate, Object: newObj}); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	oldPod := oldObj.(*v1.Pod)
 	newPod := newObj.(*v1.Pod)
 
@@ -166,7 +150,7 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 	newIsWorker := isWorkerPod(newPod)
 	if oldIsWorker && newIsWorker {
 		klog.InfoS("ignore worker pod update:", "old pod", oldPod.Name, "new pod", newPod.Name)
-		return
+		return err
 	}
 
 	_, oldOk := getModelNameFromPod(oldPod)
@@ -176,23 +160,33 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 	newHasModelInfo := newOk || len(newModelClaims) > 0
 
 	if !oldOk && !existed && !newHasModelInfo {
-		return // No model information to track in either old or new pod
+		return nil // No model information to track in either old or new pod
 	}
 
-	c.mu.Lock()
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	// TODO: No in place update is handled here
 
 	// Remove old mappings if present, no adapter will be inherited. (Adapters will be rescaned and readded later)
 	if oldOk || existed {
-		odlMetaPod := c.deletePodLocked(oldPod.Name, oldPod.Namespace)
+		odlMetaPod, err := c.deletePodLockedContext(ctx, oldPod.Name, oldPod.Namespace)
+		if err != nil {
+			return err
+		}
 		if odlMetaPod != nil {
 			for _, modelName := range odlMetaPod.Models.Array() {
+				if err = ctx.Err(); err != nil {
+					return err
+				}
 				c.deletePodAndModelMappingLocked(odlMetaPod.Name, odlMetaPod.Namespace, modelName, 1)
 			}
 		}
-		c.modelClaims.clearPod(utils.GeneratePodKey(oldPod.Namespace, oldPod.Name))
+		if err = c.modelClaims.clearPodContext(ctx, utils.GeneratePodKey(oldPod.Namespace, oldPod.Name)); err != nil {
+			return err
+		}
 	}
 
 	// ignore worker pods
@@ -202,20 +196,32 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 		c.clearPodMetricsBackoff(oldPod.Namespace, oldPod.Name)
 		c.clearPodMetricsScheduling(oldPod.Namespace, oldPod.Name)
 		klog.InfoS("ignored ray worker pod", "old pod", oldPod.Name, "new pod", newPod.Name)
-		return
+		return err
 	}
 
 	// Add new mappings if present
 	if newHasModelInfo && !newIsWorker {
-		metaPod := c.addPodLocked(newPod)
+		metaPod, err := c.addPodLockedContext(ctx, newPod)
+		if err != nil {
+			return err
+		}
 		if newOk {
-			c.addPodAndModelMappingLocked(metaPod, newModelName)
+			if err = c.addPodAndModelMappingLockedContext(ctx, metaPod, newModelName); err != nil {
+				return err
+			}
 		}
 		newPodKey := utils.GeneratePodKey(newPod.Namespace, newPod.Name)
 		for servedModel, binding := range newModelClaims {
-			c.modelClaims.set(newPodKey, servedModel, binding)
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+			if err = c.modelClaims.setContext(ctx, newPodKey, servedModel, binding); err != nil {
+				return err
+			}
 			if binding.Port > 0 {
-				c.addPodAndModelMappingLocked(metaPod, servedModel)
+				if err = c.addPodAndModelMappingLockedContext(ctx, metaPod, servedModel); err != nil {
+					return err
+				}
 			}
 		}
 	} else {
@@ -227,24 +233,31 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 	c.debugInfo()
 
 	// Notify KV event manager
-	if c.kvEventManager != nil {
-		c.kvEventManager.OnPodUpdate(oldPod, newPod)
-	}
+
+	return ctx.Err()
 }
 
 func (c *Store) deletePod(obj interface{}) {
+	if err := c.deletePodContext(context.Background(), obj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "deletePod")
+	}
+	_ = c.notifyKVEvent(context.Background(), discovery.WatchEvent{Type: discovery.EventDelete, Object: obj})
+}
+
+func (c *Store) deletePodContext(ctx context.Context, obj interface{}) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	var namespace, name string
 	var hasModelInfo bool
-	var pod *v1.Pod
 	switch obj := obj.(type) {
 	case *v1.Pod:
-		pod = obj
 		namespace, name = obj.Namespace, obj.Name
 		_, hasModelInfo = getModelNameFromPod(obj)
 		hasModelInfo = hasModelInfo || len(c.modelClaimBindingsFromPod(obj)) > 0
 	case cache.DeletedFinalStateUnknown:
 		if p, ok := obj.Obj.(*v1.Pod); ok {
-			pod = p
 			namespace, name = p.Namespace, p.Name
 			_, hasModelInfo = getModelNameFromPod(p)
 			hasModelInfo = hasModelInfo || len(c.modelClaimBindingsFromPod(p)) > 0
@@ -258,30 +271,35 @@ func (c *Store) deletePod(obj interface{}) {
 		namespace, name, err = cache.SplitMetaNamespaceKey(obj.Key)
 		if err != nil {
 			klog.ErrorS(err, "couldn't get pod's namespace and name from tombstone", "key", obj.Key)
-			return
+			return err
 		}
 	}
 	_, existed := c.metaPods.Load(utils.GeneratePodKey(namespace, name))
 	if !hasModelInfo && !existed {
-		return
+		return err
 	}
 
-	// Notify KV event manager first (before lock)
-	if c.kvEventManager != nil && pod != nil {
-		c.kvEventManager.OnPodDelete(pod)
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
 	}
-
-	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// delete base model and associated lora models on this pod
-	metaPod := c.deletePodLocked(name, namespace)
+	metaPod, err := c.deletePodLockedContext(ctx, name, namespace)
+	if err != nil {
+		return err
+	}
 	if metaPod != nil {
 		for _, modelName := range metaPod.Models.Array() {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
 			c.deletePodAndModelMappingLocked(name, namespace, modelName, 1)
 		}
 	}
-	c.modelClaims.clearPod(utils.GeneratePodKey(namespace, name))
+	if err = c.modelClaims.clearPodContext(ctx, utils.GeneratePodKey(namespace, name)); err != nil {
+		return err
+	}
 
 	c.clearPodMetricsBackoff(namespace, name)
 	c.clearPodMetricsScheduling(namespace, name)
@@ -289,39 +307,88 @@ func (c *Store) deletePod(obj interface{}) {
 
 	klog.V(4).Infof("POD DELETED: %s/%s", namespace, name)
 	c.debugInfo()
+
+	return ctx.Err()
 }
 
 func (c *Store) addModelAdapter(obj interface{}) {
-	c.mu.Lock()
+	if err := c.addModelAdapterContext(context.Background(), obj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "addModelAdapter")
+	}
+}
+
+func (c *Store) addModelAdapterContext(ctx context.Context, obj interface{}) (err error) {
+	if err = c.prepareEventRouters(ctx, discovery.WatchEvent{Type: discovery.EventAdd, Object: obj}); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	model := obj.(*modelv1alpha1.ModelAdapter)
 	for _, pod := range model.Status.Instances {
-		c.addPodAndModelMappingLockedByName(pod, model.Namespace, model.Name)
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if err = c.addPodAndModelMappingLockedByNameContext(ctx, pod, model.Namespace, model.Name); err != nil {
+			return err
+		}
 	}
 	c.setModelBaseModelLocked(model)
 
 	klog.V(4).Infof("MODELADAPTER CREATED: %s/%s", model.Namespace, model.Name)
 	c.debugInfo()
+
+	return ctx.Err()
 }
 
 func (c *Store) updateModelAdapter(oldObj interface{}, newObj interface{}) {
-	c.mu.Lock()
+	if err := c.updateModelAdapterContext(context.Background(), oldObj, newObj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "updateModelAdapter")
+	}
+}
+
+func (c *Store) updateModelAdapterContext(ctx context.Context, oldObj interface{}, newObj interface{}) (err error) {
+	if err = c.prepareEventRouters(ctx, discovery.WatchEvent{Type: discovery.EventUpdate, Object: newObj}); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	oldModel := oldObj.(*modelv1alpha1.ModelAdapter)
 	newModel := newObj.(*modelv1alpha1.ModelAdapter)
 	for _, pod := range oldModel.Status.Instances {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
 		// the namespace of the pod is same as the namespace of model
 		c.deletePodAndModelMappingLocked(pod, oldModel.Namespace, oldModel.Name, 0)
 	}
 
 	for _, pod := range newModel.Status.Instances {
-		c.addPodAndModelMappingLockedByName(pod, newModel.Namespace, newModel.Name)
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if err = c.addPodAndModelMappingLockedByNameContext(ctx, pod, newModel.Namespace, newModel.Name); err != nil {
+			return err
+		}
 	}
 	c.setModelBaseModelLocked(newModel)
 
 	c.debugInfo()
+
+	return ctx.Err()
 }
 
 // setModelBaseModelLocked records the adapter → base-model mapping on the cache
@@ -352,31 +419,53 @@ func (c *Store) setModelBaseModelLocked(model *modelv1alpha1.ModelAdapter) {
 }
 
 func (c *Store) deleteModelAdapter(obj interface{}) {
+	if err := c.deleteModelAdapterContext(context.Background(), obj); err != nil {
+		klog.ErrorS(err, "Apply discovery event", "operation", "deleteModelAdapter")
+	}
+}
+
+func (c *Store) deleteModelAdapterContext(ctx context.Context, obj interface{}) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	model, ok := obj.(*modelv1alpha1.ModelAdapter)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			return
+			return err
 		}
 		model, ok = tombstone.Obj.(*modelv1alpha1.ModelAdapter)
 		if !ok {
-			return
+			return err
 		}
 	}
 
-	c.mu.Lock()
+	if err = utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 
 	for _, pod := range model.Status.Instances {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
 		// the namespace of the pod is same as the namespace of model
 		c.deletePodAndModelMappingLocked(pod, model.Namespace, model.Name, 0)
 	}
 
 	c.debugInfo()
+
+	return ctx.Err()
 }
 
 // addPodLocked adds/resumes pod into the cache.
 func (c *Store) addPodLocked(pod *v1.Pod) *Pod {
+	mapped, _ := c.addPodLockedContext(context.Background(), pod)
+	return mapped
+}
+
+func (c *Store) addPodLockedContext(ctx context.Context, pod *v1.Pod) (*Pod, error) {
 	key := utils.GeneratePodKey(pod.Namespace, pod.Name)
 	if c.bufferPod == nil {
 		c.bufferPod = &Pod{
@@ -406,7 +495,9 @@ func (c *Store) addPodLocked(pod *v1.Pod) *Pod {
 	// same key (which take the same lock around resolving and mutating the counters
 	// this resumes) -- see podStatsLockFor's doc comment in cache_trace.go.
 	mu := c.podStatsLockFor(key)
-	mu.Lock()
+	if err := utils.LockContext(ctx, mu.TryLock, mu.Unlock); err != nil {
+		return nil, err
+	}
 	defer mu.Unlock()
 
 	resumed := false
@@ -455,7 +546,7 @@ func (c *Store) addPodLocked(pod *v1.Pod) *Pod {
 		c.bufferPod.statsGeneration = 0
 		c.bufferPod.readySince.Store(0)
 	}
-	return metaPod
+	return metaPod, ctx.Err()
 }
 
 // storeIfGreater raises *addr to val if val is larger. A plain Store could let an earlier
@@ -474,16 +565,36 @@ func storeIfGreater(addr *atomic.Int64, val int64) {
 }
 
 func (c *Store) addPodAndModelMappingLockedByName(podName, namespace, modelName string) {
+	if err := c.addPodAndModelMappingLockedByNameContext(context.Background(), podName, namespace, modelName); err != nil {
+		klog.ErrorS(err, "Map discovered model")
+	}
+}
+
+func (c *Store) addPodAndModelMappingLockedByNameContext(ctx context.Context, podName, namespace, modelName string) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	pod, ok := c.metaPods.Load(utils.GeneratePodKey(namespace, podName))
 	if !ok {
 		klog.Errorf("pod %s does not exist in internal-cache", podName)
-		return
+		return nil
 	}
 
-	c.addPodAndModelMappingLocked(pod, modelName)
+	return c.addPodAndModelMappingLockedContext(ctx, pod, modelName)
 }
 
 func (c *Store) addPodAndModelMappingLocked(metaPod *Pod, modelName string) {
+	if err := c.addPodAndModelMappingLockedContext(context.Background(), metaPod, modelName); err != nil {
+		klog.ErrorS(err, "Map discovered model")
+	}
+}
+
+func (c *Store) addPodAndModelMappingLockedContext(ctx context.Context, metaPod *Pod, modelName string) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+
 	if c.bufferModel == nil {
 		c.bufferModel = &Model{
 			Pods:            utils.NewRegistryWithArrayProvider(func(arr []*v1.Pod) *utils.PodArray { return &utils.PodArray{Pods: arr} }),
@@ -493,7 +604,13 @@ func (c *Store) addPodAndModelMappingLocked(metaPod *Pod, modelName string) {
 	metaModel, loaded := c.metaModels.LoadOrStore(modelName, c.bufferModel)
 	if !loaded {
 		c.bufferModel = nil
-		if c.modelRouterProvider != nil {
+		if c.contextRouterProvider != nil {
+			prepared, ok := c.preparedRouters.Load(modelName)
+			if !ok {
+				return fmt.Errorf("model router %q was not prepared", modelName)
+			}
+			metaModel.QueueRouter = prepared.router
+		} else if c.modelRouterProvider != nil {
 			var err error
 			metaModel.QueueRouter, err = c.modelRouterProvider(modelName)
 			if err != nil {
@@ -508,6 +625,8 @@ func (c *Store) addPodAndModelMappingLocked(metaPod *Pod, modelName string) {
 	metaModel.Pods.Store(podKey, metaPod.Pod)
 
 	klog.V(4).InfoS("Pod added to model", "model", modelName, "pod", podKey, "pods", metaModel.Pods.Len())
+
+	return ctx.Err()
 }
 
 // deletedPodSnapshot preserves a deleted pod's realtime request-tracking
@@ -537,13 +656,20 @@ type deletedPodSnapshot struct {
 const recentlyDeletedPodGracePeriod = 60 * time.Second
 
 func (c *Store) deletePodLocked(podName, podNamespace string) *Pod {
+	pod, _ := c.deletePodLockedContext(context.Background(), podName, podNamespace)
+	return pod
+}
+
+func (c *Store) deletePodLockedContext(ctx context.Context, podName, podNamespace string) (*Pod, error) {
 	key := utils.GeneratePodKey(podNamespace, podName)
 
 	// See the matching lock in addPodLocked and podStatsLockFor's doc comment
 	// (cache_trace.go): held across the snapshot-take-and-publish sequence below so
 	// it can't interleave with a concurrent addPodStats/donePodStats for this key.
 	mu := c.podStatsLockFor(key)
-	mu.Lock()
+	if err := utils.LockContext(ctx, mu.TryLock, mu.Unlock); err != nil {
+		return nil, err
+	}
 	defer mu.Unlock()
 
 	metaPod, ok := c.metaPods.LoadAndDelete(key)
@@ -562,7 +688,7 @@ func (c *Store) deletePodLocked(podName, podNamespace string) *Pod {
 		c.recentlyDeletedPods.Store(key, snap)
 		c.pruneExpiredDeletedPodSnapshotsLocked()
 	}
-	return metaPod
+	return metaPod, ctx.Err()
 }
 
 // pruneExpiredDeletedPodSnapshotsLocked drops snapshots whose grace period has

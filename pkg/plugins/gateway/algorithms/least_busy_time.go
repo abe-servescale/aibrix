@@ -26,7 +26,7 @@ import (
 const RouterLeastBusyTime types.RoutingAlgorithm = "least-busy-time"
 
 func init() {
-	Register(RouterLeastBusyTime, NewLeastBusyTimeRouter)
+	registerLocal(RouterLeastBusyTime, NewLeastBusyTimeRouter)
 }
 
 type leastBusyTimeRouter struct {

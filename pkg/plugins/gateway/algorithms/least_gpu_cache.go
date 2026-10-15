@@ -26,7 +26,7 @@ import (
 const RouterLeastGpuCache types.RoutingAlgorithm = "least-gpu-cache"
 
 func init() {
-	Register(RouterLeastGpuCache, NewLeastGpuCacheRouter)
+	registerLocal(RouterLeastGpuCache, NewLeastGpuCacheRouter)
 }
 
 type leastGpuCacheRouter struct {

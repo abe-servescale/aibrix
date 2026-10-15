@@ -91,3 +91,6 @@ labels:
       app.kubernetes.io/name: aibrix
       app.kubernetes.io/version: nightly
       app.kubernetes.io/managed-by: kubectl
+
+transformers:
+- ../gateway/discovery-namespace/transformer

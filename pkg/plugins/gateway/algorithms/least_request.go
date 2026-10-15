@@ -35,7 +35,7 @@ import (
 const RouterLeastRequest types.RoutingAlgorithm = "least-request"
 
 func init() {
-	Register(RouterLeastRequest, NewLeastRequestRouter)
+	registerLocal(RouterLeastRequest, NewLeastRequestRouter)
 }
 
 type leastRequestRouter struct {

@@ -27,7 +27,7 @@ import (
 const RouterLeastKvCache types.RoutingAlgorithm = "least-kv-cache"
 
 func init() {
-	Register(RouterLeastKvCache, NewLeastKvCacheRouter)
+	registerLocal(RouterLeastKvCache, NewLeastKvCacheRouter)
 }
 
 type leastKvCacheRouter struct {

@@ -17,6 +17,7 @@ limitations under the License.
 package routingalgorithms
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime/debug"
@@ -58,6 +59,9 @@ type queueRouter struct {
 	// it a sample taken before a drain can be published after the drain's own, leaving
 	// the gauge stuck at the stale depth.
 	pendingMu sync.Mutex
+	lifetime  context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 func NewQueueRouter(backend types.Router, queue types.RouterQueue[*types.QueueEntry]) (types.QueueRouter, error) {
@@ -66,7 +70,18 @@ func NewQueueRouter(backend types.Router, queue types.RouterQueue[*types.QueueEn
 		return nil, err
 	}
 
+	return NewQueueRouterWithContext(context.Background(), backend, queue, c)
+}
+
+// NewQueueRouterWithContext owns queue processing until lifetime cancellation.
+// Close cancels and waits for that goroutine.
+func NewQueueRouterWithContext(lifetime context.Context, backend types.Router, queue types.RouterQueue[*types.QueueEntry], c cache.Cache) (types.QueueRouter, error) {
+	if err := lifetime.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(lifetime)
 	router := &queueRouter{
+		lifetime: ctx, cancel: cancel, done: make(chan struct{}),
 		router:         backend,
 		queue:          queue,
 		cache:          c,
@@ -134,13 +149,25 @@ func (r *queueRouter) tryRoute(pods types.PodList) {
 }
 
 func (r *queueRouter) serve() {
+	lifetime := r.lifetime
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	if r.done != nil {
+		defer close(r.done)
+	}
 	for {
-		pods := <-r.chRouteTrigger
+		var pods types.PodList
+		select {
+		case <-lifetime.Done():
+			return
+		case pods = <-r.chRouteTrigger:
+		}
 
 		// Drain until there is nothing routable, or until a recovered panic left the
 		// queue at a position this loop must not advance from. routeNext routes one
 		// candidate and reports whether the loop may pick the next one right away.
-		for r.routeNext(pods) {
+		for lifetime.Err() == nil && r.routeNext(pods) {
 		}
 	}
 }
@@ -386,4 +413,12 @@ func (r *queueRouter) updateQueuePendingMetric(entry *types.QueueEntry) {
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 	emitQueuePendingMetric(entry, r.queue.Len())
+}
+
+// Close stops and awaits owned queue processing.
+func (r *queueRouter) Close() {
+	if r.cancel != nil {
+		r.cancel()
+		<-r.done
+	}
 }

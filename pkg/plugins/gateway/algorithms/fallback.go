@@ -16,6 +16,8 @@ limitations under the License.
 package routingalgorithms
 
 import (
+	"context"
+
 	"github.com/vllm-project/aibrix/pkg/types"
 )
 
@@ -31,6 +33,15 @@ type FallbackRouter struct {
 func (r *FallbackRouter) SetFallback(fallback types.RoutingAlgorithm, provider types.RouterProviderFunc) {
 	r.fallbackAlgorithm = fallback
 	r.fallbackProvider = provider
+}
+
+// SetFallbackContext configures the local fallback without external I/O.
+func (r *FallbackRouter) SetFallbackContext(ctx context.Context, fallback types.RoutingAlgorithm, provider types.RouterProviderFunc) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.SetFallback(fallback, provider)
+	return ctx.Err()
 }
 
 func (r *FallbackRouter) Route(ctx *types.RoutingContext, pods types.PodList) (string, error) {

@@ -25,7 +25,7 @@ import (
 const RouterLeastLatency types.RoutingAlgorithm = "least-latency"
 
 func init() {
-	Register(RouterLeastLatency, NewLeastExpectedLatencyRouter)
+	registerLocal(RouterLeastLatency, NewLeastExpectedLatencyRouter)
 }
 
 type leastExpectedLatencyRouter struct {

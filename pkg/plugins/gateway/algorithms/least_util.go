@@ -26,7 +26,7 @@ import (
 const RouterUtil types.RoutingAlgorithm = "least-utilization"
 
 func init() {
-	Register(RouterUtil, NewLeastUtilRouter)
+	registerLocal(RouterUtil, NewLeastUtilRouter)
 }
 
 type leastUtilRouter struct {

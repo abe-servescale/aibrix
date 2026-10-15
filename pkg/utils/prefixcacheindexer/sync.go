@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/vllm-project/aibrix/pkg/utils"
 	"github.com/vllm-project/aibrix/pkg/utils/syncable"
 )
 
@@ -60,11 +61,13 @@ func decodeBlock(data []byte) (Block, error) {
 // GetSnapshotForSync returns the current prefix cache state as id -> serialized Block
 // for use by a Redis sync layer. Caller must not modify the returned map.
 func (c *PrefixHashTable) GetSnapshotForSync(ctx context.Context) (map[string][]byte, error) {
-	c.mu.RLock()
+	if err := utils.LockContext(ctx, c.mu.TryRLock, c.mu.RUnlock); err != nil {
+		return nil, err
+	}
 	defer c.mu.RUnlock()
 	out := make(map[string][]byte)
 	var encodeErr error
-	c.store.Range(func(blockHash uint64, block Block) bool {
+	rangeErr := c.rangeBlocksContext(ctx, func(blockHash uint64, block Block) bool {
 		select {
 		case <-ctx.Done():
 			return false
@@ -81,7 +84,13 @@ func (c *PrefixHashTable) GetSnapshotForSync(ctx context.Context) (map[string][]
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
-	return out, ctx.Err()
+	if rangeErr != nil {
+		return nil, rangeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // EncodeBlockForSync returns the serialized form of the block for the given
@@ -112,7 +121,9 @@ func (c *PrefixHashTable) GetDeltaForSync(ctx context.Context) (updated map[stri
 	// path (seqSearchPrefix, also an RLock caller) is not blocked during JSON
 	// encoding. Block.modelToPods contains maps (reference types), so a deep
 	// copy is required before releasing the lock.
-	c.mu.RLock()
+	if err := utils.LockContext(ctx, c.mu.TryRLock, c.mu.RUnlock); err != nil {
+		return nil, nil, err
+	}
 	c.deltaSeq.Store(c.dirtySeq)
 	if len(c.dirtyIds) == 0 {
 		c.mu.RUnlock()
@@ -128,7 +139,11 @@ func (c *PrefixHashTable) GetDeltaForSync(ctx context.Context) (updated map[stri
 		if e != nil {
 			continue
 		}
-		block, ok := c.store.Get(blockHash)
+		block, ok, readErr := c.getBlockContext(ctx, blockHash)
+		if readErr != nil {
+			c.mu.RUnlock()
+			return nil, nil, readErr
+		}
 		if !ok {
 			continue // evicted since marked dirty; Redis key may linger until TTL
 		}
@@ -172,7 +187,9 @@ func copyBlock(b Block) Block {
 // ClearDirtyForSync clears the blocks returned by the last GetDeltaForSync after
 // a successful delta push. Blocks changed after that call stay dirty.
 func (c *PrefixHashTable) ClearDirtyForSync(ctx context.Context) error {
-	c.mu.Lock()
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
 	pushed := c.deltaSeq.Load()
 	for id, seq := range c.dirtyIds {
@@ -194,9 +211,14 @@ func (c *PrefixHashTable) ApplyRemoteForSync(ctx context.Context, id string, dat
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return err
+	}
 	defer c.mu.Unlock()
-	existing, ok := c.store.Get(blockHash)
+	existing, ok, err := c.getBlockContext(ctx, blockHash)
+	if err != nil {
+		return err
+	}
 	if ok {
 		// Merge: keep newer of each pod's last access time per model
 		for model, pods := range block.modelToPods {
@@ -209,11 +231,10 @@ func (c *PrefixHashTable) ApplyRemoteForSync(ctx context.Context, id string, dat
 				}
 			}
 		}
-		c.store.Put(blockHash, existing)
+		return c.putBlockContext(ctx, blockHash, existing)
 	} else {
-		c.store.Put(blockHash, block)
+		return c.putBlockContext(ctx, blockHash, block)
 	}
-	return nil
 }
 
 const prefixCacheNamespace = "prefixcache"

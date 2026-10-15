@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,9 +28,10 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
@@ -58,6 +60,7 @@ const (
 	defaultGRPCMaxMessageSizeBytes = 4 * 1024 * 1024
 	envGRPCMaxMessageSizeBytes     = "AIBRIX_GRPC_MAX_MESSAGE_SIZE_BYTES"
 	envDisableRateLimiting         = "AIBRIX_DISABLE_RATE_LIMITING"
+	modelDiscoveryStartupTimeout   = 30 * time.Second
 	envPriorityTierEnabled         = "AIBRIX_PRIORITY_TIER_ENABLED"
 )
 
@@ -76,6 +79,7 @@ type kubeAPIOptions struct {
 }
 
 type modelDiscoveryOptions struct {
+	namespace          string
 	watchModelAdapters bool
 	watchModelClaims   bool
 	listMode           string
@@ -83,6 +87,8 @@ type modelDiscoveryOptions struct {
 }
 
 func (o *modelDiscoveryOptions) addFlags(fs *flag.FlagSet) {
+	fs.StringVar(&o.namespace, "installation-namespace", "",
+		"Model workload namespace; required in Kubernetes mode.")
 	fs.BoolVar(&o.watchModelAdapters, "watch-model-adapters", true,
 		"List and watch ModelAdapter resources in Kubernetes discovery.")
 	fs.BoolVar(&o.watchModelClaims, "watch-model-claims", true,
@@ -103,12 +109,23 @@ func (o modelDiscoveryOptions) validate() error {
 	return nil
 }
 
-func (o modelDiscoveryOptions) kubernetesProvider(config *rest.Config) *discovery.KubernetesProvider {
-	provider := discovery.NewKubernetesProvider(config).WithModelAdapters(o.watchModelAdapters)
+func (o modelDiscoveryOptions) validateNamespace(isStandalone bool) error {
+	if isStandalone {
+		return nil
+	}
+	return discovery.ValidateNamespace(o.namespace)
+}
+
+func (o modelDiscoveryOptions) kubernetesProvider(config *rest.Config) (*discovery.KubernetesProvider, error) {
+	provider, err := discovery.NewKubernetesProviderForNamespace(config, o.namespace)
+	if err != nil {
+		return nil, err
+	}
+	provider.WithModelAdapters(o.watchModelAdapters)
 	if o.watchModelClaims {
 		provider = provider.WithModelClaims()
 	}
-	return provider
+	return provider, nil
 }
 
 func startEarlyModelListGate(enabled bool, addr string) (*gateway.ModelListGate, error) {
@@ -164,6 +181,14 @@ func (o kubeAPIOptions) applyTo(config *rest.Config) {
 }
 
 func main() {
+	if err := runGateway(); err != nil {
+		klog.ErrorS(err, "Gateway stopped")
+		klog.Flush()
+		os.Exit(1)
+	}
+}
+
+func runGateway() error {
 	var kubeAPI kubeAPIOptions
 	kubeAPI.addFlags(flag.CommandLine)
 	var modelDiscovery modelDiscoveryOptions
@@ -180,49 +205,29 @@ func main() {
 	defer klog.Flush()
 	flag.Parse()
 	if err := kubeAPI.validate(); err != nil {
-		klog.Fatal(err)
+		return err
 	}
-	if err := modelDiscovery.validate(); err != nil {
-		klog.Fatal(err)
+	if err := modelDiscovery.validateForMode(standalone); err != nil {
+		return err
 	}
 
-	// Resolve HTTP bind address: prefer --http-bind-address, fall back to deprecated --metrics-bind-address
-	if httpAddr == "" {
-		if metricsAddr != "" {
-			klog.Warning("--metrics-bind-address is deprecated, use --http-bind-address instead")
-			httpAddr = metricsAddr
-		} else {
-			httpAddr = ":8080"
-		}
-	}
+	httpAddr = resolveHTTPAddress(httpAddr, metricsAddr)
 
 	// Validate standalone mode flags
 	if standalone && endpointsConfig == "" {
-		klog.Fatal("--endpoints-config is required when running in standalone mode")
+		return errors.New("--endpoints-config is required when running in standalone mode")
 	}
 
-	redisClient := utils.GetRedisClient()
-	if redisClient == nil {
-		if standalone {
-			klog.Warning("Running without Redis: rate limiting and user auth disabled")
-		} else {
-			klog.Fatal("Redis is required in Kubernetes mode")
-		}
-	} else {
-		defer func() {
-			if err := redisClient.Close(); err != nil {
-				klog.Warningf("Error closing Redis client: %v", err)
-			}
-		}()
+	redisClient, err := prepareGatewayRedis(standalone)
+	if err != nil {
+		return err
 	}
+	defer closeGatewayRedis(redisClient)
 
-	// stopCh is closed either on normal return (via defer) or proactively in
-	// the signal handler before calling os.Exit. sync.Once guards against a
-	// double-close panic.
-	stopCh := make(chan struct{})
-	var stopOnce sync.Once
-	stopFn := func() { stopOnce.Do(func() { close(stopCh) }) }
-	defer stopFn()
+	lifetimeCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	lifetimeCtx, cancelLifetime := context.WithCancel(lifetimeCtx)
+	defer cancelLifetime()
 
 	var config *rest.Config
 	var k8sClient kubernetes.Interface
@@ -234,64 +239,82 @@ func main() {
 		klog.Info("Running in standalone mode")
 		discoveryProvider = discovery.NewStaticProvider(endpointsConfig)
 	} else {
-		// Kubernetes mode: load config and create clients
 		var err error
-		kubeConfig := flag.Lookup("kubeconfig").Value.String()
-		if kubeConfig == "" {
-			klog.Info("using in-cluster configuration")
-			config, err = rest.InClusterConfig()
-		} else {
-			klog.Infof("using configuration from '%s'", kubeConfig)
-			config, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
-		}
+		config, k8sClient, gatewayK8sClient, err = loadGatewayKubernetes(flag.Lookup("kubeconfig").Value.String(), kubeAPI)
 		if err != nil {
-			klog.Fatalf("Error building kubeconfig: %v", err)
+			return err
+		}
+		discoveryProvider, err = modelDiscovery.kubernetesProvider(config)
+		if err != nil {
+			return err
 		}
 
-		kubeAPI.applyTo(config)
-
-		k8sClient, err = kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Fatalf("Error creating kubernetes client: %v", err)
-		}
-
-		gatewayK8sClient, err = versioned.NewForConfig(config)
-		if err != nil {
-			klog.Fatalf("Error on creating gateway k8s client: %v", err)
-		}
-		discoveryProvider = modelDiscovery.kubernetesProvider(config)
 	}
-	modelListGate, err := startEarlyModelListGate(modelDiscovery.maxAge > 0, httpAddr)
+	startupCtx := lifetimeCtx
+	cancelStartup := func() {}
+	if !standalone {
+		startupCtx, cancelStartup = context.WithTimeout(lifetimeCtx, modelDiscoveryStartupTimeout)
+	}
+	defer cancelStartup()
+	modelListGate, err := startEarlyModelListGate(!standalone || modelDiscovery.maxAge > 0, httpAddr)
 	if err != nil {
-		klog.Fatalf("Failed to start model-list HTTP server: %v", err)
+		return fmt.Errorf("start model-list HTTP server: %w", err)
 	}
 	defer modelListGate.Shutdown()
+	stopOnStartup := context.AfterFunc(startupCtx, func() {
+		if !modelListGate.Published() {
+			cancelLifetime()
+		}
+	})
+	defer stopOnStartup()
 
 	// Initialize cache
 	kvSyncEnabled := utils.LoadEnvBool(constants.EnvPrefixCacheKVEventSyncEnabled, false)
 	remoteTokenizerEnabled := utils.LoadEnvBool(constants.EnvPrefixCacheUseRemoteTokenizer, false)
 
-	cache.InitWithOptions(config, stopCh, cache.InitOptions{
-		IsGateway:                    true,
-		EnableKVSync:                 kvSyncEnabled && remoteTokenizerEnabled,
-		RedisClient:                  redisClient,
-		ModelRouterProvider:          routing.ModelRouterFactory,
-		DiscoveryProvider:            discoveryProvider,
-		DisableModelClaimPodBindings: !standalone && !modelDiscovery.watchModelClaims,
-		ModelListMaxAge:              modelDiscovery.maxAge,
-	})
+	cacheOptions := cache.InitOptions{
+		InstallationNamespace:          modelDiscovery.namespace,
+		ModelRouterProviderWithContext: routing.NewSLORouterWithContext,
+		IsGateway:                      true,
+		EnableKVSync:                   kvSyncEnabled && remoteTokenizerEnabled,
+		RedisClient:                    redisClient,
+		DiscoveryProvider:              discoveryProvider,
+		DisableModelClaimPodBindings:   !standalone && !modelDiscovery.watchModelClaims,
+		ModelListMaxAge:                modelDiscovery.maxAge,
+	}
+	gatewayCache, err := initializeGatewayCache(startupCtx, lifetimeCtx, config, cacheOptions, standalone)
+	if err != nil {
+		return fmt.Errorf("gateway startup in namespace %q: %w", modelDiscovery.namespace, err)
+	}
+
+	defer gatewayCache.Close()
+	defer func() {
+		cancelLifetime()
+		if modelListGate != nil {
+			modelListGate.Disable()
+		}
+	}()
 
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
-		klog.Fatalf("failed to listen: %v", err)
+		return fmt.Errorf("listen: %w", err)
 	}
 
-	gatewayServer := gateway.NewServerWithOptions(redisClient, k8sClient, gatewayK8sClient, gateway.ServerOptions{
+	defer func() { _ = lis.Close() }()
+	serverOptions := gateway.ServerOptions{
+		LifetimeContext:     lifetimeCtx,
 		DisableRateLimiting: utils.LoadEnvBool(envDisableRateLimiting, false),
 		PriorityTier:        utils.LoadEnvBool(envPriorityTierEnabled, false),
 		ModelListMode:       gateway.ModelListMode(modelDiscovery.listMode),
 		VerifyModelList:     modelDiscovery.maxAge > 0,
-	})
+	}
+
+	gatewayServer, err := gateway.NewServerWithContext(startupCtx, redisClient, k8sClient, gatewayK8sClient, serverOptions)
+
+	if err != nil {
+		return err
+	}
+	defer gatewayServer.Shutdown()
 
 	stateSyncEnabled := utils.LoadEnvBool("AIBRIX_STATESYNC_ENABLED", false)
 	var syncManager *statesync.RedisSync
@@ -301,36 +324,18 @@ func main() {
 		table.EnableDeltaSync()
 		syncManager = statesync.New(redisClient)
 		syncManager.Register(prefixcacheindexer.NewPrefixHashTableSyncable(table))
-		syncManager.Start()
+		syncManager.StartWithContext(lifetimeCtx)
+		defer syncManager.Stop()
 	} else {
 		klog.InfoS("statesync disabled; set AIBRIX_STATESYNC_ENABLED=true to enable cross-replica state sync")
 	}
 
-	if err := startGatewayHTTPServer(modelListGate, gatewayServer, httpAddr); err != nil {
-		klog.Fatalf("Failed to start HTTP server: %v", err)
+	telApp, opts, err := initializeGatewayTelemetry(startupCtx)
+	if err != nil {
+		return err
 	}
-	klog.Infof("Started HTTP server on %s", httpAddr)
-
-	var opts []grpc.ServerOption
-
-	otelEnabled := utils.OTELEnabled()
-	var telApp *utils.Telemetry
-	if otelEnabled {
-		otlpProtocol := utils.LoadEnv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
-		if otlpProtocol == "http/protobuf" {
-			otlpProtocol = "http"
-		}
-		telApp, err = utils.InitOpenTelemetry("aibrix-gateway-plugin", otlpProtocol)
-		if err != nil || telApp == nil {
-			klog.Fatalf("Failed to initialize OpenTelemetry: %v", err)
-		}
-		opts = append(opts, grpc.StatsHandler(
-			otelgrpc.NewServerHandler(
-				otelgrpc.WithFilter(
-					filters.Not(filters.HealthCheck()),
-				),
-			),
-		))
+	if telApp != nil {
+		defer telApp.Shutdown()
 	}
 
 	grpcMaxMessageSize := utils.LoadEnvInt(envGRPCMaxMessageSizeBytes, defaultGRPCMaxMessageSizeBytes)
@@ -345,38 +350,50 @@ func main() {
 	extProcPb.RegisterExternalProcessorServer(s, gatewayServer)
 
 	healthCheck := health.NewServer()
-	healthPb.RegisterHealthServer(s, healthCheck)
-	healthCheck.SetServingStatus("gateway-plugin", healthPb.HealthCheckResponse_SERVING)
+	defer healthCheck.Shutdown()
+	healthCheck.SetServingStatus("gateway-plugin", healthPb.HealthCheckResponse_NOT_SERVING)
+	healthService := &lifetimeHealthServer{Server: healthCheck, lifetime: lifetimeCtx}
+	if !standalone {
+		healthService.ready = modelListGate.Published
+	}
+	healthPb.RegisterHealthServer(s, healthService)
+	err = publishGateway(startupCtx, lifetimeCtx, modelListGate, gatewayServer, healthCheck, httpAddr)
+	if err != nil {
+		return fmt.Errorf("publish gateway readiness: %w", err)
+	}
+	stopOnStartup()
+	cancelStartup()
+	if err := gatewayCache.StartGatewayBackground(cacheOptions); err != nil {
+		return err
+	}
+	klog.Infof("Started HTTP server on %s", httpAddr)
 
 	klog.Info("starting gRPC server on " + grpcAddr)
 
-	startPprofServer(pprofAddr)
+	profiling := startPprofServer(pprofAddr)
+	if profiling != nil {
+		defer func() { _ = profiling.Close() }()
+	}
 
 	klog.Infof("GOMAXPROCS is: %d", runtime.GOMAXPROCS(0))
 
-	var gracefulStop = make(chan os.Signal, 1)
-	signal.Notify(gracefulStop, syscall.SIGINT, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
-		sig := <-gracefulStop
-		klog.Warningf("signal received: %v, initiating graceful shutdown...", sig)
-		if syncManager != nil {
-			syncManager.Stop()
+		defer close(shutdownDone)
+		<-lifetimeCtx.Done()
+		if modelListGate != nil {
+			modelListGate.Disable()
 		}
-		gatewayServer.Shutdown()
-		modelListGate.Shutdown()
-		s.GracefulStop()
-		if otelEnabled {
-			telApp.Shutdown()
-		}
-		// Close stopCh so that cache ticker goroutines and other consumers tied
-		// to this signal exit promptly; os.Exit below bypasses deferred calls.
-		stopFn()
-		os.Exit(0)
+		healthCheck.SetServingStatus("gateway-plugin", healthPb.HealthCheckResponse_NOT_SERVING)
+		s.Stop()
 	}()
 
+	defer func() { cancelLifetime(); <-shutdownDone }()
+
 	if err := s.Serve(lis); err != nil {
-		panic(err)
+		return err
 	}
+	return nil
 }
 
 // startPprofServer serves the profiling endpoints (http.DefaultServeMux, where
@@ -401,4 +418,174 @@ func startPprofServer(addr string) net.Listener {
 		}
 	}()
 	return ln
+}
+
+func (o modelDiscoveryOptions) validateForMode(isStandalone bool) error {
+	if err := o.validate(); err != nil {
+		return err
+	}
+	return o.validateNamespace(isStandalone)
+}
+
+func resolveHTTPAddress(addr, deprecated string) string {
+	if addr != "" {
+		return addr
+	}
+	if deprecated != "" {
+		klog.Warning("--metrics-bind-address is deprecated, use --http-bind-address instead")
+		return deprecated
+	}
+	return ":8080"
+}
+
+func loadGatewayKubernetes(
+	path string, options kubeAPIOptions,
+) (*rest.Config, kubernetes.Interface, versioned.Interface, error) {
+	var config *rest.Config
+	var err error
+	if path == "" {
+		config, err = rest.InClusterConfig()
+	} else {
+		config, err = clientcmd.BuildConfigFromFlags("", path)
+	}
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("build kubeconfig: %w", err)
+	}
+	options.applyTo(config)
+	core, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create Kubernetes client: %w", err)
+	}
+	gatewayClient, err := versioned.NewForConfig(config)
+	return config, core, gatewayClient, err
+}
+
+func publishGateway(
+	startup, lifetime context.Context, gate *gateway.ModelListGate, server *gateway.Server,
+	healthCheck *health.Server, httpAddr string,
+) (err error) {
+	if gate != nil {
+		err = gate.Publish(startup, lifetime, server, func(ready bool) {
+			status := healthPb.HealthCheckResponse_NOT_SERVING
+			if ready {
+				status = healthPb.HealthCheckResponse_SERVING
+			}
+			healthCheck.SetServingStatus("gateway-plugin", status)
+		})
+	} else {
+		if err = startup.Err(); err == nil {
+			err = lifetime.Err()
+		}
+		if err == nil {
+			err = startGatewayHTTPServer(nil, server, httpAddr)
+		}
+		if err == nil {
+			healthCheck.SetServingStatus("gateway-plugin", healthPb.HealthCheckResponse_SERVING)
+		}
+	}
+	return err
+}
+
+func prepareGatewayRedis(isStandalone bool) (*redis.Client, error) {
+	client := utils.GetRedisClient()
+	if client == nil {
+		if !isStandalone {
+			return nil, errors.New("redis is required in Kubernetes mode")
+		}
+		klog.Warning("Running without Redis: rate limiting and user auth disabled")
+	}
+	return client, nil
+}
+
+func closeGatewayRedis(client *redis.Client) {
+	if client != nil {
+		if err := client.Close(); err != nil {
+			klog.Warningf("Error closing Redis client: %v", err)
+		}
+	}
+}
+
+func initializeGatewayCache(
+	startup, lifetime context.Context, config *rest.Config, opts cache.InitOptions, isStandalone bool,
+) (*cache.Store, error) {
+	if isStandalone {
+		opts.ModelRouterProviderWithContext = nil
+		opts.ModelRouterProvider = routing.ModelRouterFactory
+		return cache.InitWithOptions(config, lifetime.Done(), opts), nil
+	}
+	return cache.InitGatewayWithOptions(startup, lifetime, config, opts)
+}
+
+func initializeGatewayTelemetry(startupCtx context.Context) (*utils.Telemetry, []grpc.ServerOption, error) {
+	var err error
+	var opts []grpc.ServerOption
+
+	otelEnabled := utils.OTELEnabled()
+	var telApp *utils.Telemetry
+	if otelEnabled {
+		otlpProtocol := utils.LoadEnv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+		if otlpProtocol == "http/protobuf" {
+			otlpProtocol = "http"
+		}
+		telApp, err = utils.InitOpenTelemetryWithContext(startupCtx, "aibrix-gateway-plugin", otlpProtocol)
+		if err != nil || telApp == nil {
+			return nil, nil, fmt.Errorf("initialize OpenTelemetry: %w", err)
+		}
+		opts = append(opts, grpc.StatsHandler(
+			otelgrpc.NewServerHandler(
+				otelgrpc.WithFilter(
+					filters.Not(filters.HealthCheck()),
+				),
+			),
+		))
+	}
+
+	return telApp, opts, nil
+}
+
+func kubernetesDiscoveryClients(kubeAPI kubeAPIOptions, models modelDiscoveryOptions) (
+	*rest.Config, kubernetes.Interface, versioned.Interface, discovery.Provider, error,
+) {
+	kubeConfig := flag.Lookup("kubeconfig").Value.String()
+	var config *rest.Config
+	var err error
+	if kubeConfig == "" {
+		klog.Info("using in-cluster configuration")
+		config, err = rest.InClusterConfig()
+	} else {
+		klog.Infof("using configuration from '%s'", kubeConfig)
+		config, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
+	}
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("build kubeconfig: %w", err)
+	}
+	kubeAPI.applyTo(config)
+	core, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	gatewayClient, err := versioned.NewForConfig(config)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	provider, err := models.kubernetesProvider(config)
+	return config, core, gatewayClient, provider, err
+}
+
+func validateStartupOptions(
+	kubeAPI kubeAPIOptions, models modelDiscoveryOptions, standalone bool, endpoints string,
+) error {
+	if err := kubeAPI.validate(); err != nil {
+		return err
+	}
+	if err := models.validate(); err != nil {
+		return err
+	}
+	if !standalone {
+		return discovery.ValidateNamespace(models.namespace)
+	}
+	if endpoints == "" {
+		return fmt.Errorf("--endpoints-config is required when running in standalone mode")
+	}
+	return nil
 }

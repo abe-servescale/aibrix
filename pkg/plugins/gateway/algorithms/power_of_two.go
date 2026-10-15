@@ -32,7 +32,7 @@ import (
 const RouterPowerOfTwo types.RoutingAlgorithm = "power-of-two"
 
 func init() {
-	Register(RouterPowerOfTwo, NewPowerOfTwoRouter)
+	registerLocal(RouterPowerOfTwo, NewPowerOfTwoRouter)
 }
 
 // PowerOfTwoRouter implements the power of two choices algorithm: it samples two distinct

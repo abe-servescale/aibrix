@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vllm-project/aibrix/pkg/utils"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vllm-project/aibrix/pkg/cache"
 	"github.com/vllm-project/aibrix/pkg/constants"
@@ -58,6 +60,11 @@ type tokenizerEntry struct {
 
 // TokenizerPool manages model-specific tokenizers with caching and health checking
 type TokenizerPool struct {
+	lifetime    context.Context
+	cancel      context.CancelFunc
+	checkerDone chan struct{}
+	closeOnce   sync.Once
+
 	mu                sync.RWMutex
 	tokenizers        map[string]*tokenizerEntry // model -> tokenizer mapping
 	config            TokenizerPoolConfig
@@ -149,8 +156,16 @@ func (m *TokenizerPoolMetrics) unregister() {
 }
 
 // NewTokenizerPool creates a new TokenizerPool instance
-func NewTokenizerPool(config TokenizerPoolConfig, cache cache.Cache) *TokenizerPool {
+func NewTokenizerPool(config TokenizerPoolConfig, c cache.Cache) *TokenizerPool {
+	return NewTokenizerPoolWithContext(context.Background(), config, c)
+}
+
+// NewTokenizerPoolWithContext owns health checks and their I/O under lifetime.
+// The caller must Close to cancel, await the checker, and release tokenizers.
+func NewTokenizerPoolWithContext(lifetime context.Context, config TokenizerPoolConfig, cache cache.Cache) *TokenizerPool {
+	run, cancel := context.WithCancel(lifetime)
 	pool := &TokenizerPool{
+		lifetime: run, cancel: cancel,
 		tokenizers: make(map[string]*tokenizerEntry),
 		config:     config,
 		cache:      cache,
@@ -308,7 +323,7 @@ func (p *TokenizerPool) createOrUpdateTokenizer(model string, pods []*v1.Pod) to
 	}
 
 	// Verify health (outside of lock)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(p.lifetime, 5*time.Second)
 	defer cancel()
 
 	if remoteTok, ok := tok.(interface{ IsHealthy(context.Context) bool }); ok {
@@ -473,15 +488,17 @@ func isPodReady(pod *v1.Pod) bool {
 
 // startHealthChecker starts the background health checking routine
 func (p *TokenizerPool) startHealthChecker() {
+	p.checkerDone = make(chan struct{})
 	ticker := time.NewTicker(p.config.HealthCheckPeriod)
 	go func() {
+		defer close(p.checkerDone)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				p.performHealthCheck()
 				p.cleanupStaleTokenizers()
-			case <-p.stopCh:
+			case <-p.lifetime.Done():
 				return
 			}
 		}
@@ -490,12 +507,14 @@ func (p *TokenizerPool) startHealthChecker() {
 
 // performHealthCheck checks health of all tokenizers
 func (p *TokenizerPool) performHealthCheck() {
-	p.mu.Lock()
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
 	defer p.mu.Unlock()
 
 	for model, entry := range p.tokenizers {
 		if remoteTok, ok := entry.tokenizer.(interface{ IsHealthy(context.Context) bool }); ok {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(p.lifetime, 5*time.Second)
 			healthy := remoteTok.IsHealthy(ctx)
 			cancel()
 
@@ -519,8 +538,10 @@ func (p *TokenizerPool) cleanupStaleTokenizers() {
 		tok   tokenizer.Tokenizer
 	}
 
-	// Collect stale tokenizers under lock
-	p.mu.Lock()
+	// Collect stale tokenizers under a cancellable lock.
+	if err := utils.LockContext(p.lifetime, p.mu.TryLock, p.mu.Unlock); err != nil {
+		return
+	}
 	now := time.Now()
 	for model, entry := range p.tokenizers {
 		// Remove if unused for TTL duration
@@ -548,8 +569,18 @@ func (p *TokenizerPool) cleanupStaleTokenizers() {
 
 // Close gracefully shuts down the TokenizerPool
 func (p *TokenizerPool) Close() error {
-	// Stop health checker
-	close(p.stopCh)
+	p.closeOnce.Do(func() {
+		p.cancel()
+		close(p.stopCh)
+		if p.checkerDone != nil {
+			<-p.checkerDone
+		}
+		_ = p.closeTokenizers()
+	})
+	return nil
+}
+
+func (p *TokenizerPool) closeTokenizers() error {
 
 	var tokenizersToClose []struct {
 		model string

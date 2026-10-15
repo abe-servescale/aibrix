@@ -117,3 +117,19 @@ func TestLRUStore_ConcurrentEvictions(t *testing.T) {
 		}
 	}
 }
+
+func TestDisabledEvictionCloseReturns(t *testing.T) {
+	store := NewLRUStore[string, int](2, time.Minute, 0, time.Now)
+	store.Put("model", 1)
+	done := make(chan struct{})
+	go func() { store.Close(); store.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for a disabled eviction worker")
+	}
+	value, ok := store.Get("model")
+	if !ok || value != 1 {
+		t.Fatal("closing eviction discarded cache entries")
+	}
+}

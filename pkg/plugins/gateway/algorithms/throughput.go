@@ -31,7 +31,7 @@ import (
 const RouterThroughput types.RoutingAlgorithm = "throughput"
 
 func init() {
-	Register(RouterThroughput, NewThroughputRouter)
+	registerLocal(RouterThroughput, NewThroughputRouter)
 }
 
 type throughputRouter struct {

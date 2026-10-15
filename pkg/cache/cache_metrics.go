@@ -250,9 +250,19 @@ var (
 	prometheusBasicAuthPass string
 )
 
+var prometheusAuthMu sync.Mutex
+
 func initPrometheusAPI(kubeConfig *rest.Config) prometheusv1.API {
+	api, _ := initPrometheusAPIWithContext(context.Background(), kubeConfig)
+	return api
+}
+
+func initPrometheusAPIWithContext(ctx context.Context, kubeConfig *rest.Config) (prometheusv1.API, error) {
 	prometheusEndpoint := utils.LoadEnv("PROMETHEUS_ENDPOINT", "")
-	loadPrometheusBasicAuth(kubeConfig)
+	loadPrometheusBasicAuthWithContext(ctx, kubeConfig)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Initialize Prometheus API
 	var prometheusApi prometheusv1.API
@@ -265,13 +275,22 @@ func initPrometheusAPI(kubeConfig *rest.Config) prometheusv1.API {
 			klog.Infof("Prometheus API initialized successfully")
 		}
 	}
-	return prometheusApi
+	return prometheusApi, nil
 }
 
 // loadPrometheusBasicAuth initializes Prometheus basic auth credentials exactly once (via sync.Once).
 // It loads from a Kubernetes Secret when PROMETHEUS_BASIC_AUTH_SECRET_NAME is set; otherwise it falls back to env vars.
 // The resulting values are stored in package-level variables prometheusBasicAuthUser/prometheusBasicAuthPass.
 func loadPrometheusBasicAuth(kubeConfig *rest.Config) {
+	loadPrometheusBasicAuthWithContext(context.Background(), kubeConfig)
+}
+
+func loadPrometheusBasicAuthWithContext(ctx context.Context, kubeConfig *rest.Config) {
+	if err := utils.LockContext(ctx, prometheusAuthMu.TryLock, prometheusAuthMu.Unlock); err != nil {
+		return
+	}
+	defer prometheusAuthMu.Unlock()
+
 	prometheusBasicAuthOnce.Do(func() {
 		secretName := utils.LoadEnv("PROMETHEUS_BASIC_AUTH_SECRET_NAME", "")
 		if secretName == "" {
@@ -295,7 +314,7 @@ func loadPrometheusBasicAuth(kubeConfig *rest.Config) {
 			return
 		}
 
-		secret, err := clientset.CoreV1().Secrets(secretNamespace).Get(context.Background(), secretName, metav1.GetOptions{})
+		secret, err := clientset.CoreV1().Secrets(secretNamespace).Get(ctx, secretName, metav1.GetOptions{})
 		if err != nil {
 			klog.ErrorS(err, "Failed to read Prometheus basic auth secret", "namespace", secretNamespace, "name", secretName)
 			return
@@ -362,10 +381,22 @@ func (c *Store) updatePodMetrics() {
 	})
 }
 
-func (c *Store) worker(jobs <-chan *Pod) {
-	for pod := range jobs {
+func (c *Store) worker(jobs <-chan *Pod) { c.workerContext(context.Background(), jobs) }
+
+func (c *Store) workerContext(lifetime context.Context, jobs <-chan *Pod) {
+	for {
+		var pod *Pod
+		select {
+		case <-lifetime.Done():
+			return
+		case next, ok := <-jobs:
+			if !ok {
+				return
+			}
+			pod = next
+		}
 		c.markPodMetricsInFlight(pod)
-		ctx, cancel := context.WithTimeout(context.Background(), podMetricsFetchTimeout)
+		ctx, cancel := context.WithTimeout(lifetime, podMetricsFetchTimeout)
 		podMetricPort := getPodMetricPort(pod)
 		func() {
 			defer c.finishPodMetricsScheduling(pod)
@@ -415,7 +446,7 @@ func (c *Store) worker(jobs <-chan *Pod) {
 				c.updateThroughputToksPerS(pod, model, metric, metricValue)
 				metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: model}, pod.Pod, metric, metricValue, metricValue.GetLabelValues())
 
-				if metric == metrics.EngineSleepState && c.kvEventManager != nil {
+				if manager := c.kvManager(); metric == metrics.EngineSleepState && manager != nil {
 					// The prefix router and the KV-event subscription both key
 					// on the pod-metadata model name (constants.ModelNameFromMetadata),
 					// not the Prometheus-reported model_name label resolved
@@ -424,7 +455,7 @@ func (c *Store) worker(jobs <-chan *Pod) {
 					// it never subscribed under (review on #2735).
 					if podModelName, ok := constants.ModelNameFromMetadata(pod.Labels, pod.Annotations); ok {
 						podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
-						c.kvEventManager.CheckSleepStateBackstop(ctx, podKey, podModelName, podLoraID(pod), metricValue.GetSimpleValue())
+						manager.CheckSleepStateBackstop(ctx, podKey, podModelName, podLoraID(pod), metricValue.GetSimpleValue())
 					}
 				}
 			}

@@ -35,7 +35,7 @@ import (
 const RouterLeastRequestTopK types.RoutingAlgorithm = "least-request-top-k"
 
 func init() {
-	Register(RouterLeastRequestTopK, NewLeastRequestTopKRouter)
+	registerLocal(RouterLeastRequestTopK, NewLeastRequestTopKRouter)
 }
 
 // leastRequestTopKCandidates (K) bounds the eligible set by rank. Plain least-request always picks

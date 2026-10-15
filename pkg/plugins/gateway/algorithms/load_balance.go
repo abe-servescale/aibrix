@@ -108,7 +108,7 @@ func recordLoadImbalance(model string) {
 }
 
 func init() {
-	Register(RouterLoadBalance, NewLoadBalanceRouter)
+	registerLocal(RouterLoadBalance, NewLoadBalanceRouter)
 }
 
 type loadBalanceRouter struct {

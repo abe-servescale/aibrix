@@ -22,5 +22,5 @@ import (
 
 func init() {
 	// Register the VTC Basic router
-	Register(vtc.RouterVTCBasic, vtc.NewVTCBasicRouter)
+	registerLocal(vtc.RouterVTCBasic, vtc.NewVTCBasicRouter)
 }

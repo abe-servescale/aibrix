@@ -706,7 +706,7 @@ type RouterManager struct {
 	routerInited      context.Context
 	routerDoneInit    context.CancelFunc
 	routerFactory     map[types.RoutingAlgorithm]types.RouterProviderFunc
-	routerConstructor map[types.RoutingAlgorithm]types.RouterProviderRegistrationFunc
+	routerConstructor map[types.RoutingAlgorithm]routerConstructorRegistration
 	initErrors        map[types.RoutingAlgorithm]error
 	// multiRouterCache is keyed by (possibly blended) algorithm string; both it and
 	// unblendableLogged below are capped at maxCachedAlgorithmStrings since the key is
@@ -716,15 +716,28 @@ type RouterManager struct {
 	// emitted a V(2) "skipping auto-blend" line. It is log-once bookkeeping only: Select
 	// still re-evaluates the blend on every request so a later Register/Init can start
 	// blending, and so a transient construct error is retried rather than black-holed.
-	unblendableLogged map[string]struct{}
-	routerMu          sync.RWMutex
+	unblendableLogged  map[string]struct{}
+	initMu             sync.Mutex
+	createdRouters     []types.Router
+	ownedPrefixIndexer *prefixcacheindexer.PrefixHashTable
+	routerMu           sync.RWMutex
+}
+
+// ContextRouterConstructor must honor startup during setup and assign ongoing
+// work to lifetime. A returned router with resources must provide Cleanup;
+// partial construction failures must clean up resources not returned to manager.
+type ContextRouterConstructor func(startup, lifetime context.Context) (types.Router, error)
+
+type routerConstructorRegistration struct {
+	construct  ContextRouterConstructor
+	contextual bool
 }
 
 func NewRouterManager() *RouterManager {
 	rm := &RouterManager{}
 	rm.routerInited, rm.routerDoneInit = context.WithTimeout(context.Background(), 5*time.Second)
 	rm.routerFactory = make(map[types.RoutingAlgorithm]types.RouterProviderFunc)
-	rm.routerConstructor = make(map[types.RoutingAlgorithm]types.RouterProviderRegistrationFunc)
+	rm.routerConstructor = make(map[types.RoutingAlgorithm]routerConstructorRegistration)
 	rm.initErrors = make(map[types.RoutingAlgorithm]error)
 	rm.multiRouterCache = make(map[string]*multiStrategyRouter)
 	rm.unblendableLogged = make(map[string]struct{})
@@ -739,8 +752,19 @@ func NewRouterManagerWithDefaults() *RouterManager {
 }
 
 func newIsolatedRouterManager() *RouterManager {
+	manager, err := newIsolatedRouterManagerContext(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	return manager
+}
+
+func newIsolatedRouterManagerContext(ctx context.Context) (*RouterManager, error) {
 	rm := NewRouterManager()
-	defaultRM.routerMu.RLock()
+	if err := utils.LockContext(ctx, defaultRM.routerMu.TryRLock, defaultRM.routerMu.RUnlock); err != nil {
+		rm.routerDoneInit()
+		return nil, err
+	}
 	defer defaultRM.routerMu.RUnlock()
 	for algorithm, constructor := range defaultRM.routerConstructor {
 		rm.routerConstructor[algorithm] = constructor
@@ -748,7 +772,7 @@ func newIsolatedRouterManager() *RouterManager {
 	for algorithm, provider := range defaultRM.routerFactory {
 		rm.routerFactory[algorithm] = provider
 	}
-	return rm
+	return rm, nil
 }
 
 // NewRouterManagerWithCache creates an isolated manager whose cache-backed
@@ -762,29 +786,49 @@ func NewRouterManagerWithCache(c cache.Cache) *RouterManager {
 // indexer when it is non-nil. A nil indexer preserves the default per-manager
 // prefix table behavior.
 func NewRouterManagerWithCacheAndPrefixIndexer(c cache.Cache, indexer *prefixcacheindexer.PrefixHashTable) *RouterManager {
+	manager, err := NewRouterManagerWithCacheContext(context.Background(), c, indexer)
+	if err != nil {
+		panic(err)
+	}
+	return manager
+}
+
+// NewRouterManagerWithCacheContext bounds the shared-registration lock wait by
+// startup ctx, then wires explicit cache state into an isolated manager. It
+// returns ctx's error on canceled setup. Close owns any table created for a nil
+// indexer; supplied tables remain caller-owned. Init assigns worker lifetime.
+func NewRouterManagerWithCacheContext(ctx context.Context, c cache.Cache, indexer *prefixcacheindexer.PrefixHashTable) (*RouterManager, error) {
+	rm, err := newIsolatedRouterManagerContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if indexer == nil {
 		indexer = prefixcacheindexer.NewPrefixHashTable()
+		rm.ownedPrefixIndexer = indexer
 	}
-	rm := newIsolatedRouterManager()
 	// The cache-backed strategies registered below capture c. All other registrations are
 	// copied from the production manager and retain their original dependencies
 	// (for example, SLO providers still resolve their configured cache).
 	rm.RegisterProvider(RouterRandom, RandomRouterProviderFunc)
-	rm.Register(RouterLeastRequest, func() (types.Router, error) { return NewLeastRequestRouterWithCache(c) })
-	rm.Register(RouterLeastRequestTopK, func() (types.Router, error) { return NewLeastRequestTopKRouterWithCache(c), nil })
-	rm.Register(RouterLeastKvCache, func() (types.Router, error) { return NewLeastKvCacheRouterWithCache(c) })
-	rm.Register(RouterLeastLatency, func() (types.Router, error) { return NewLeastLatencyRouterWithCache(c) })
-	rm.Register(RouterLoadBalance, func() (types.Router, error) { return NewLoadBalanceRouterWithCache(c) })
-	rm.Register(RouterPrefixCache, func() (types.Router, error) {
-		return NewPrefixCacheRouterWithOptions(c, indexer)
+	rm.registerLocal(RouterLeastRequest, func() (types.Router, error) { return NewLeastRequestRouterWithCache(c) })
+	rm.registerLocal(RouterLeastRequestTopK, func() (types.Router, error) { return NewLeastRequestTopKRouterWithCache(c), nil })
+	rm.registerLocal(RouterLeastKvCache, func() (types.Router, error) { return NewLeastKvCacheRouterWithCache(c) })
+	rm.registerLocal(RouterLeastLatency, func() (types.Router, error) { return NewLeastLatencyRouterWithCache(c) })
+	rm.registerLocal(RouterLoadBalance, func() (types.Router, error) { return NewLoadBalanceRouterWithCache(c) })
+	rm.RegisterContext(RouterPrefixCache, func(ctx, lifetime context.Context) (types.Router, error) {
+		return NewPrefixCacheRouterWithOptionsContext(ctx, lifetime, c, indexer)
 	})
-	rm.Register(RouterPD, func() (types.Router, error) {
-		return NewPDRouterWithCacheAndPrefixIndexer(c, indexer)
+	rm.RegisterContext(RouterPD, func(startup, lifetime context.Context) (types.Router, error) {
+		return NewPDRouterWithContext(startup, lifetime, c, indexer)
 	})
-	rm.Register(RouterExternal, func() (types.Router, error) {
+	rm.registerLocal(RouterExternal, func() (types.Router, error) {
 		return newExternalRouterWithCacheAndSelector(c, rm.Select)
 	})
-	return rm
+	if err := ctx.Err(); err != nil {
+		rm.Close()
+		return nil, err
+	}
+	return rm, nil
 }
 
 // Validate validates if user provided routing routers is supported by gateway
@@ -1034,29 +1078,43 @@ func (rm *RouterManager) getOrCreateMultiStrategyRouter(algStr string, cfg *Mult
 }
 
 func (rm *RouterManager) Register(algorithm types.RoutingAlgorithm, constructor types.RouterConstructor) {
+	rm.registerConstructor(algorithm, routerConstructorRegistration{construct: func(_, _ context.Context) (types.Router, error) { return constructor() }})
+}
+func Register(algorithm types.RoutingAlgorithm, constructor types.RouterConstructor) {
+	defaultRM.Register(algorithm, constructor)
+}
+
+// RegisterContext supplies constructors whose waits honor startup and whose
+// workers are owned by lifetime. Configure registrations before initialization.
+func (rm *RouterManager) RegisterContext(algorithm types.RoutingAlgorithm, constructor ContextRouterConstructor) {
+	rm.registerConstructor(algorithm, routerConstructorRegistration{construct: constructor, contextual: true})
+}
+
+// RegisterContext installs a context-aware constructor on the global manager.
+// The constructor owns setup errors and must expose Cleanup for live resources.
+func RegisterContext(algorithm types.RoutingAlgorithm, constructor ContextRouterConstructor) {
+	defaultRM.RegisterContext(algorithm, constructor)
+}
+
+// registerLocal is only for built-in constructors without I/O or lock waits.
+func (rm *RouterManager) registerLocal(algorithm types.RoutingAlgorithm, constructor types.RouterConstructor) {
+	rm.RegisterContext(algorithm, func(ctx, _ context.Context) (types.Router, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return constructor()
+	})
+}
+func registerLocal(algorithm types.RoutingAlgorithm, constructor types.RouterConstructor) {
+	defaultRM.registerLocal(algorithm, constructor)
+}
+
+func (rm *RouterManager) registerConstructor(algorithm types.RoutingAlgorithm, registration routerConstructorRegistration) {
 	rm.routerMu.Lock()
 	defer rm.routerMu.Unlock()
 	rm.multiRouterCache = make(map[string]*multiStrategyRouter)
 	rm.unblendableLogged = make(map[string]struct{})
-	rm.routerConstructor[algorithm] = func() types.RouterProviderFunc {
-		router, err := constructor()
-		if err != nil {
-			rm.initErrors[algorithm] = err
-			if errors.Is(err, ErrExternalRouterDisabled) {
-				klog.V(4).Infof("Optional router %s is disabled", algorithm)
-			} else {
-				klog.Errorf("Failed to construct router for %s: %v", algorithm, err)
-			}
-			return nil
-		}
-		delete(rm.initErrors, algorithm)
-		return func(_ *types.RoutingContext) (types.Router, error) {
-			return router, nil
-		}
-	}
-}
-func Register(algorithm types.RoutingAlgorithm, constructor types.RouterConstructor) {
-	defaultRM.Register(algorithm, constructor)
+	rm.routerConstructor[algorithm] = registration
 }
 
 func (rm *RouterManager) RegisterProvider(algorithm types.RoutingAlgorithm, provider types.RouterProviderFunc) {
@@ -1072,25 +1130,44 @@ func RegisterProvider(algorithm types.RoutingAlgorithm, provider types.RouterPro
 }
 
 func (rm *RouterManager) SetFallback(router types.Router, fallback types.RoutingAlgorithm) error {
+	return rm.setFallback(context.Background(), router, fallback, true)
+}
+
+// SetFallbackContext waits for initialization and captures the provider under
+// the manager lock, then invokes the context-aware setter outside that lock.
+func (rm *RouterManager) SetFallbackContext(ctx context.Context, router types.Router, fallback types.RoutingAlgorithm) error {
+	return rm.setFallback(ctx, router, fallback, false)
+}
+func (rm *RouterManager) setFallback(ctx context.Context, router types.Router, fallback types.RoutingAlgorithm, legacy bool) error {
 	r, ok := router.(types.FallbackRouter)
 	if !ok {
 		return ErrFallbackNotSupported
 	}
-
-	<-rm.routerInited.Done()
-	initErr := rm.routerInited.Err()
-	if initErr != context.Canceled {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-rm.routerInited.Done():
+	}
+	if initErr := rm.routerInited.Err(); initErr != context.Canceled {
 		return fmt.Errorf("router did not initialized: %v", initErr)
 	}
-
-	rm.routerMu.RLock()
-	defer rm.routerMu.RUnlock()
-
-	if provider, ok := rm.routerFactory[fallback]; !ok {
-		return ErrFallbackNotRegistered
-	} else {
-		r.SetFallback(fallback, provider)
+	if err := utils.LockContext(ctx, rm.routerMu.TryRLock, rm.routerMu.RUnlock); err != nil {
+		return err
 	}
+	provider, exists := rm.routerFactory[fallback]
+	rm.routerMu.RUnlock()
+	if !exists {
+		return ErrFallbackNotRegistered
+	}
+	if contextual, ok := router.(interface {
+		SetFallbackContext(context.Context, types.RoutingAlgorithm, types.RouterProviderFunc) error
+	}); ok {
+		return contextual.SetFallbackContext(ctx, fallback, provider)
+	}
+	if !legacy {
+		return fmt.Errorf("fallback setter must support context cancellation")
+	}
+	r.SetFallback(fallback, provider)
 	return nil
 }
 func SetFallback(router types.Router, fallback types.RoutingAlgorithm) error {
@@ -1098,43 +1175,132 @@ func SetFallback(router types.Router, fallback types.RoutingAlgorithm) error {
 }
 
 func (rm *RouterManager) Init() {
-	rm.routerMu.Lock()
-	defer rm.routerMu.Unlock()
-	rm.initErrors = make(map[types.RoutingAlgorithm]error)
-	for algorithm, constructor := range rm.routerConstructor {
-		rm.routerFactory[algorithm] = constructor()
-		klog.V(4).Infof("Registered router for %s", algorithm)
+	if err := rm.initialize(context.Background(), context.Background(), true); err != nil {
+		klog.ErrorS(err, "Initialize routers")
 	}
-	// External fallback names are process configuration and must resolve during
-	// initialization. Leaving a constructed external router with a missing
-	// fallback would defer an operator error to the request path.
-	if provider := rm.routerFactory[RouterExternal]; provider != nil {
-		// The provider probe reads immutable external configuration only. Its
-		// synthetic context is pooled and must not escape initialization.
-		probeCtx := RouterExternal.NewContext(context.Background(), "", "", "init", "")
-		router, err := provider(probeCtx)
-		probeCtx.Delete()
+}
+
+// InitContext uses ctx for both setup and continuing work. Call Close to await
+// all created resources; use InitWithLifetimeContext for a separate live context.
+func (rm *RouterManager) InitContext(ctx context.Context) error {
+	return rm.InitWithLifetimeContext(ctx, ctx)
+}
+
+// InitWithLifetimeContext snapshots registrations, constructs outside the lock,
+// and publishes complete results only while startup still permits it. Setup
+// errors clean up newly created resources and preserve wrapped cancellation.
+// Lifetime owns ongoing work; Close cancels and awaits each router's resources.
+func (rm *RouterManager) InitWithLifetimeContext(ctx, lifetime context.Context) error {
+	return rm.initialize(ctx, lifetime, false)
+}
+
+func (rm *RouterManager) initialize(ctx, lifetime context.Context, legacy bool) (err error) {
+	defer func() {
+		if err != nil && rm.ownedPrefixIndexer != nil {
+			rm.ownedPrefixIndexer.Close()
+		}
+	}()
+	if err = utils.LockContext(ctx, rm.initMu.TryLock, rm.initMu.Unlock); err != nil {
+		return err
+	}
+	defer rm.initMu.Unlock()
+	if err = utils.LockContext(ctx, rm.routerMu.TryRLock, rm.routerMu.RUnlock); err != nil {
+		return err
+	}
+	registrations := make(map[types.RoutingAlgorithm]routerConstructorRegistration, len(rm.routerConstructor))
+	providers := make(map[types.RoutingAlgorithm]types.RouterProviderFunc, len(rm.routerFactory))
+	for name, registration := range rm.routerConstructor {
+		registrations[name] = registration
+	}
+	for name, provider := range rm.routerFactory {
+		providers[name] = provider
+	}
+	rm.routerMu.RUnlock()
+	failures := make(map[types.RoutingAlgorithm]error)
+	created := make([]types.Router, 0, len(registrations))
+	defer func() {
 		if err != nil {
-			rm.initErrors[RouterExternal] = err
-			rm.routerFactory[RouterExternal] = nil
+			for _, router := range created {
+				cleanupRouter(router)
+			}
+		}
+	}()
+	for name, registration := range registrations {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if !legacy && !registration.contextual {
+			return fmt.Errorf("router %s requires a context-aware constructor", name)
+		}
+		router, constructorErr := registration.construct(ctx, lifetime)
+		if router != nil {
+			created = append(created, router)
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if constructorErr != nil {
+			failures[name] = constructorErr
+			providers[name] = nil
+			continue
+		}
+		result := router
+		providers[name] = func(*types.RoutingContext) (types.Router, error) { return result, nil }
+	}
+	if provider := providers[RouterExternal]; provider != nil {
+		probe := RouterExternal.NewContext(ctx, "", "", "init", "")
+		router, probeErr := provider(probe)
+		probe.Delete()
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if probeErr != nil {
+			failures[RouterExternal] = probeErr
+			providers[RouterExternal] = nil
 		} else if configured, ok := router.(interface{ ConfiguredFallback() types.RoutingAlgorithm }); ok {
 			fallback := configured.ConfiguredFallback()
-			if fallback != "" && (fallback == RouterExternal || rm.routerFactory[fallback] == nil || isExclusiveStrategyName(string(fallback))) {
-				var initErr error
+			if fallback != "" && (fallback == RouterExternal || providers[fallback] == nil || isExclusiveStrategyName(string(fallback))) {
 				if isExclusiveStrategyName(string(fallback)) {
-					initErr = fmt.Errorf("fallback %s is an exclusive router that requires Gateway preprocessing", fallback)
+					failures[RouterExternal] = fmt.Errorf("fallback %s is an exclusive router that requires Gateway preprocessing", fallback)
 				} else {
-					initErr = fmt.Errorf("fallback %s is not a registered local router", fallback)
+					failures[RouterExternal] = fmt.Errorf("fallback %s is not a registered local router", fallback)
 				}
-				klog.Errorf("Failed to initialize external router: %v", initErr)
-				rm.initErrors[RouterExternal] = initErr
-				rm.routerFactory[RouterExternal] = nil
+				providers[RouterExternal] = nil
 			}
 		}
 	}
+	if err = utils.LockContext(ctx, rm.routerMu.TryLock, rm.routerMu.Unlock); err != nil {
+		return err
+	}
+	defer rm.routerMu.Unlock()
+	rm.routerFactory = providers
+	rm.initErrors = failures
+	rm.createdRouters = created
 	rm.multiRouterCache = make(map[string]*multiStrategyRouter)
 	rm.unblendableLogged = make(map[string]struct{})
 	rm.routerDoneInit()
+	return nil
+}
+
+func cleanupRouter(router types.Router) {
+	if cleanup, ok := router.(interface{ Cleanup() error }); ok {
+		_ = cleanup.Cleanup()
+	}
+}
+
+// Close stops and awaits resources constructed by this manager.
+func (rm *RouterManager) Close() {
+	rm.routerDoneInit()
+	rm.routerMu.Lock()
+	created := rm.createdRouters
+	rm.createdRouters = nil
+	rm.routerMu.Unlock()
+	for _, router := range created {
+		cleanupRouter(router)
+	}
+	if rm.ownedPrefixIndexer != nil {
+		rm.ownedPrefixIndexer.Close()
+	}
 }
 
 // InitializationError reports the most recent constructor failure for a

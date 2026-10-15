@@ -131,7 +131,12 @@ func NewSLOQueue(provider types.RouterProviderFunc, modelName string) (router *S
 		return nil, err
 	}
 
-	router = &SLOQueue{
+	return NewSLOQueueWithCache(provider, modelName, c), nil
+}
+
+// NewSLOQueueWithCache constructs a queue against unpublished startup state.
+func NewSLOQueueWithCache(provider types.RouterProviderFunc, modelName string, c cache.Cache) *SLOQueue {
+	router := &SLOQueue{
 		routerProvider: provider,
 		cache:          c,
 		modelName:      modelName,
@@ -145,7 +150,7 @@ func NewSLOQueue(provider types.RouterProviderFunc, modelName string) (router *S
 	}
 	router.subpool.New = func() any { return NewSimpleQueue[*types.QueueEntry](initialSubQueueSize) }
 	router.expandDequeueCandidatesLocked(initialTotalSubQueues)
-	return router, nil
+	return router
 }
 
 func (q *SLOQueue) Enqueue(entry *types.QueueEntry, currentTime time.Time) error {

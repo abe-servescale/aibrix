@@ -180,7 +180,8 @@ func (e *DefaultExecutor) Execute(routingCtx *types.RoutingContext, prefillPod *
 		// could land on whichever request has since taken the object. The leg
 		// is per-incarnation and inert once its request is done.
 		leg := routingCtx.PDLeg()
-		go func() {
+		admitted := utils.GoWithOwner(asyncContext, func(taskCtx context.Context) {
+			asyncCtx.Context = taskCtx
 			incPrefillOutstanding()
 			defer decPrefillOutstanding()
 			defer e.prefillDone(requestID)
@@ -233,7 +234,12 @@ func (e *DefaultExecutor) Execute(routingCtx *types.RoutingContext, prefillPod *
 				"prefill_time_taken", prefillEndTime.Sub(prefillStartTime),
 				"outstanding_prefill_requests", e.tracker.GetPrefillRequestCountsForPod(prefillPodKey)-1)
 			klog.InfoS("prefill_request_end", completionFields...)
-		}()
+		})
+		if !admitted {
+			e.prefillDone(requestID)
+			leg.FinishDecodeAbort()
+			return context.Canceled
+		}
 		return nil
 	}
 

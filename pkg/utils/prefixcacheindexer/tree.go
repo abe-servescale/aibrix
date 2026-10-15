@@ -17,6 +17,7 @@ limitations under the License.
 package prefixcacheindexer
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -51,10 +52,17 @@ type TreeNode struct {
 // GetModelToPods returns a deep copy of the model-to-pods mapping.
 // Callers can safely iterate the returned maps without holding any lock.
 func (n *TreeNode) GetModelToPods() map[string]map[string]time.Time {
-	n.mu.RLock()
+	result, _ := n.getModelToPodsContext(context.Background())
+	return result
+}
+
+func (n *TreeNode) getModelToPodsContext(ctx context.Context) (map[string]map[string]time.Time, error) {
+	if err := utils.LockContext(ctx, n.mu.TryRLock, n.mu.RUnlock); err != nil {
+		return nil, err
+	}
 	defer n.mu.RUnlock()
 	if n.modelToPods == nil {
-		return nil
+		return nil, nil
 	}
 	snapshot := make(map[string]map[string]time.Time, len(n.modelToPods))
 	for model, pods := range n.modelToPods {
@@ -64,7 +72,7 @@ func (n *TreeNode) GetModelToPods() map[string]map[string]time.Time {
 		}
 		snapshot[model] = podsCopy
 	}
-	return snapshot
+	return snapshot, nil
 }
 
 func (n *TreeNode) InitAndUpdateModelPod(model string, podName string, timestamp time.Time) {
@@ -637,7 +645,15 @@ func (c *LPRadixCache) doesExceededTTL(node *TreeNode, now time.Time) bool {
 }
 
 func (c *LPRadixCache) Evict(now time.Time) []*TreeNode {
-	c.mu.Lock()
+	nodes, _ := c.EvictContext(context.Background(), now)
+	return nodes
+}
+
+// EvictContext lets an owning worker cancel all eviction lock waits.
+func (c *LPRadixCache) EvictContext(ctx context.Context, now time.Time) ([]*TreeNode, error) {
+	if err := utils.LockContext(ctx, c.mu.TryLock, c.mu.Unlock); err != nil {
+		return nil, err
+	}
 	defer c.mu.Unlock()
 	var nodesToEvict []*TreeNode
 	for _, node := range c.allNodes {
@@ -650,13 +666,17 @@ func (c *LPRadixCache) Evict(now time.Time) []*TreeNode {
 		}
 	}
 	// Actually perform the eviction
+	var evicted []*TreeNode
 	for _, node := range nodesToEvict {
-		c.evictNode(node)
+		if err := c.evictNodeContext(ctx, node); err != nil {
+			return evicted, err
+		}
+		evicted = append(evicted, node)
 	}
 	if len(nodesToEvict) > 0 {
 		klog.V(4).InfoS("Evicted %d nodes", "nodeCount", len(nodesToEvict))
 	}
-	return nodesToEvict
+	return evicted, nil
 }
 
 func (c *LPRadixCache) collectNodeAndChildren(node *TreeNode) []*TreeNode {
@@ -679,18 +699,27 @@ func (c *LPRadixCache) collectNodeAndChildren(node *TreeNode) []*TreeNode {
 
 // Fix for evictNode method in tree.go
 func (c *LPRadixCache) evictNode(node *TreeNode) {
+	_ = c.evictNodeContext(context.Background(), node)
+}
+
+func (c *LPRadixCache) evictNodeContext(ctx context.Context, node *TreeNode) error {
 	if node == c.rootNode {
-		return
+		return nil
 	}
 
 	// Snapshot the node's pod mappings before traversing parents, to avoid
 	// reading current.modelToPods without current.mu (races with RemovePodsNotInSet).
-	modelToPodsSnapshot := node.GetModelToPods()
+	modelToPodsSnapshot, err := node.getModelToPodsContext(ctx)
+	if err != nil {
+		return err
+	}
 
 	// Clean up pod mappings in parent nodes.
 	// Acquire parent.mu to prevent concurrent map access from GetModelToPods callers.
 	for parent := node.parent; parent != nil; parent = parent.parent {
-		parent.mu.Lock()
+		if err := utils.LockContext(ctx, parent.mu.TryLock, parent.mu.Unlock); err != nil {
+			return err
+		}
 		for model, pods := range modelToPodsSnapshot {
 			if parentPods, ok := parent.modelToPods[model]; ok {
 				for podName := range pods {
@@ -707,7 +736,9 @@ func (c *LPRadixCache) evictNode(node *TreeNode) {
 	// Remove node from parent's children.
 	// Acquire parent.mu to prevent concurrent map access from GetChildren callers.
 	if node.parent != nil {
-		node.parent.mu.Lock()
+		if err := utils.LockContext(ctx, node.parent.mu.TryLock, node.parent.mu.Unlock); err != nil {
+			return err
+		}
 		delete(node.parent.children, node.key[0])
 		node.parent.mu.Unlock()
 	}
@@ -725,6 +756,7 @@ func (c *LPRadixCache) evictNode(node *TreeNode) {
 	node.value = nil
 	node.key = nil
 	node.refCounter = nil
+	return nil
 }
 
 func (c *LPRadixCache) splitNode(key []int, child *TreeNode, splitLen int) *TreeNode {

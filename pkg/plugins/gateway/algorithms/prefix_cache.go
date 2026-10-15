@@ -18,6 +18,7 @@ package routingalgorithms
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -144,10 +145,16 @@ func (m *PrefixCacheMetrics) register() error {
 
 // initializePrefixCacheMetrics initializes and registers prefix cache metrics
 func initializePrefixCacheMetrics() error {
+	return initializePrefixCacheMetricsContext(context.Background())
+}
+
+func initializePrefixCacheMetricsContext(ctx context.Context) error {
+	if err := utils.LockContext(ctx, prefixCacheMetricsMu.TryLock, prefixCacheMetricsMu.Unlock); err != nil {
+		return err
+	}
+	defer prefixCacheMetricsMu.Unlock()
 	var err error
 	prefixCacheMetricsOnce.Do(func() {
-		prefixCacheMetricsMu.Lock()
-		defer prefixCacheMetricsMu.Unlock()
 
 		metrics := createPrefixCacheMetrics()
 		if registerErr := metrics.register(); registerErr != nil {
@@ -169,7 +176,7 @@ func getPrefixCacheMetrics() *PrefixCacheMetrics {
 }
 
 func init() {
-	Register(RouterPrefixCache, NewPrefixCacheRouter)
+	RegisterContext(RouterPrefixCache, NewPrefixCacheRouterWithContext)
 
 	// This prefix-cache-specific gate (and its tuning knob) was replaced by the centralized
 	// load-imbalance gate the gateway now applies ahead of every non-exclusive strategy (see
@@ -199,7 +206,9 @@ type prefixCacheRouter struct {
 	tokenizerPool TokenizerPoolInterface // nil when not using remote tokenizer
 
 	// KV sync router - only created when needed
-	kvSyncRouter *kvSyncPrefixCacheRouter
+	kvSyncRouter      *kvSyncPrefixCacheRouter
+	managedLifecycle  bool
+	ownsPrefixIndexer bool
 }
 
 // TokenizerPoolInterface defines the interface for tokenizer pools
@@ -247,11 +256,28 @@ func loadTokenizerPoolConfigFromEnv() TokenizerPoolConfig {
 }
 
 func NewPrefixCacheRouter() (types.Router, error) {
+	return NewPrefixCacheRouterWithContext(context.Background(), context.Background())
+}
+
+// NewPrefixCacheRouterWithContext cancels setup waits through startup and owns
+// continuing tokenizer/index work under lifetime. Cleanup cancels and awaits
+// its workers. Setup cancellation returns an error wrapping startup.Err().
+func NewPrefixCacheRouterWithContext(startup, lifetime context.Context) (types.Router, error) {
 	c, err := cache.Get()
 	if err != nil {
 		return nil, err
 	}
-	return NewPrefixCacheRouterWithOptions(c, prefixcacheindexer.GetSharedPrefixHashTable())
+	indexer := prefixcacheindexer.GetSharedPrefixHashTableWithContext(lifetime)
+	router, err := NewPrefixCacheRouterWithOptionsContext(startup, lifetime, c, indexer)
+	if err != nil {
+		if lifetime.Done() != nil {
+			indexer.Close()
+		}
+		return nil, err
+	}
+	owned := router.(prefixCacheRouter)
+	owned.ownsPrefixIndexer = lifetime.Done() != nil
+	return owned, nil
 }
 
 // NewPrefixCacheRouterWithCache constructs the prefix-cache router with an
@@ -265,8 +291,21 @@ func NewPrefixCacheRouterWithCache(c cache.Cache) (types.Router, error) {
 // a new private table; the production constructor passes the shared table
 // explicitly.
 func NewPrefixCacheRouterWithOptions(c cache.Cache, indexer *prefixcacheindexer.PrefixHashTable) (types.Router, error) {
+	return NewPrefixCacheRouterWithOptionsContext(context.Background(), context.Background(), c, indexer)
+}
+
+// NewPrefixCacheRouterWithOptionsContext uses explicit cache state during
+// cancellable setup. Cleanup owns tokenizer work under lifetime and any table
+// created for a nil indexer; a supplied table remains caller-owned.
+func NewPrefixCacheRouterWithOptionsContext(startup, lifetime context.Context, c cache.Cache, indexer *prefixcacheindexer.PrefixHashTable) (types.Router, error) {
+	if err := startup.Err(); err != nil {
+		return nil, err
+	}
 	// Initialize prefix cache metrics if enabled
-	if err := initializePrefixCacheMetrics(); err != nil {
+	if err := initializePrefixCacheMetricsContext(startup); err != nil {
+		if startup.Err() != nil {
+			return nil, startup.Err()
+		}
 		klog.Errorf("Failed to initialize prefix cache metrics: %v", err)
 		// Continue without metrics rather than failing
 	}
@@ -305,7 +344,7 @@ func NewPrefixCacheRouterWithOptions(c cache.Cache, indexer *prefixcacheindexer.
 		poolConfig.DefaultTokenizer = defaultTokenizer
 
 		// Create the pool
-		pool := NewTokenizerPool(poolConfig, c)
+		pool := NewTokenizerPoolWithContext(lifetime, poolConfig, c)
 		tokenizerPool = pool
 
 		// Use panic tokenizer to catch any direct usage
@@ -326,13 +365,16 @@ func NewPrefixCacheRouterWithOptions(c cache.Cache, indexer *prefixcacheindexer.
 		"matched_pods_running_requests_standard_deviation_factor", standardDeviationFactor)
 
 	// Create main router with local indexer
+	ownsIndexer := indexer == nil
 	if indexer == nil {
-		indexer = prefixcacheindexer.NewPrefixHashTable()
+		indexer = prefixcacheindexer.NewPrefixHashTableWithContext(lifetime)
 	}
 	router := prefixCacheRouter{
 		cache:              c,
 		tokenizer:          tokenizerObj,
 		prefixCacheIndexer: indexer,
+		managedLifecycle:   lifetime.Done() != nil,
+		ownsPrefixIndexer:  ownsIndexer,
 		// Only assign tokenizerPool if it's not nil to avoid interface nil issues
 	}
 
@@ -346,20 +388,30 @@ func NewPrefixCacheRouterWithOptions(c cache.Cache, indexer *prefixcacheindexer.
 		kvSyncRouter := &kvSyncPrefixCacheRouter{
 			cache:         c,
 			tokenizerPool: tokenizerPool,
-			syncIndexer:   syncindexer.GetSharedSyncPrefixHashTable(),
+			syncIndexer:   syncindexer.GetSharedSyncPrefixHashTableWithContext(lifetime),
 		}
 
 		router.kvSyncRouter = kvSyncRouter
 
-		if metrics := getPrefixCacheMetrics(); metrics != nil {
+		if metrics, metricsErr := getPrefixCacheMetricsContext(startup); metricsErr != nil {
+			_ = router.Cleanup()
+			return nil, metricsErr
+		} else if metrics != nil {
 			metrics.prefixCacheIndexerStatus.WithLabelValues("_init_", "sync").Set(1)
 			metrics.prefixCacheIndexerStatus.WithLabelValues("_init_", "local").Set(0)
 		}
-	} else if metrics := getPrefixCacheMetrics(); metrics != nil {
+	} else if metrics, metricsErr := getPrefixCacheMetricsContext(startup); metricsErr != nil {
+		_ = router.Cleanup()
+		return nil, metricsErr
+	} else if metrics != nil {
 		metrics.prefixCacheIndexerStatus.WithLabelValues("_init_", "local").Set(1)
 		metrics.prefixCacheIndexerStatus.WithLabelValues("_init_", "sync").Set(0)
 	}
 
+	if err := startup.Err(); err != nil {
+		_ = router.Cleanup()
+		return nil, err
+	}
 	return router, nil
 }
 
@@ -644,7 +696,13 @@ func (k *kvSyncPrefixCacheRouter) ScoreAll(ctx *types.RoutingContext, readyPodLi
 }
 
 // Cleanup gracefully shuts down the TokenizerPool if it exists
-func (p *prefixCacheRouter) Cleanup() error {
+func (p prefixCacheRouter) Cleanup() error {
+	if p.ownsPrefixIndexer && p.prefixCacheIndexer != nil {
+		p.prefixCacheIndexer.Close()
+	}
+	if p.managedLifecycle && p.kvSyncRouter != nil && p.kvSyncRouter.syncIndexer != nil {
+		p.kvSyncRouter.syncIndexer.Close()
+	}
 	if p.tokenizerPool != nil {
 		klog.Info("Shutting down TokenizerPool...")
 		if err := p.tokenizerPool.Close(); err != nil {
@@ -1012,4 +1070,12 @@ func recordRoutingError(model, reason string, usingKVSync bool) {
 		return
 	}
 	metrics.prefixCacheRoutingErrors.WithLabelValues(model, reason, strconv.FormatBool(usingKVSync)).Inc()
+}
+
+func getPrefixCacheMetricsContext(ctx context.Context) (*PrefixCacheMetrics, error) {
+	if err := utils.LockContext(ctx, prefixCacheMetricsMu.TryRLock, prefixCacheMetricsMu.RUnlock); err != nil {
+		return nil, err
+	}
+	defer prefixCacheMetricsMu.RUnlock()
+	return prefixCacheMetrics, nil
 }

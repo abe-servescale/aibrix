@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -30,7 +31,32 @@ import (
 	"github.com/vllm-project/aibrix/pkg/constants"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 )
+
+func TestGatewayDiscoveryRequiresMatchingNamespace(t *testing.T) {
+	config := &rest.Config{Host: "http://127.0.0.1:1"}
+	legacy := discovery.NewKubernetesProvider(config)
+	scoped, err := discovery.NewKubernetesProviderForNamespace(config, "workloads")
+	require.NoError(t, err)
+	for _, options := range []InitOptions{
+		{IsGateway: true},
+		{IsGateway: true, InstallationNamespace: " workloads"},
+		{IsGateway: true, InstallationNamespace: "workloads", DiscoveryProvider: legacy},
+		{IsGateway: true, InstallationNamespace: "foreign", DiscoveryProvider: scoped},
+	} {
+		// These fail before singleton initialization or any Kubernetes request.
+		_, err := InitWithContext(context.Background(), config, make(chan struct{}), options)
+		require.Error(t, err)
+	}
+	implicit, err := gatewayDiscoveryProvider(config, InitOptions{IsGateway: true, InstallationNamespace: "workloads"})
+	require.NoError(t, err)
+	require.Equal(t, "workloads", implicit.(*discovery.KubernetesProvider).Namespace())
+	_, err = gatewayDiscoveryProvider(config, InitOptions{DiscoveryProvider: legacy})
+	require.NoError(t, err, "non-gateway discovery retains its legacy scope")
+	_, err = gatewayDiscoveryProvider(nil, InitOptions{IsGateway: true, DiscoveryProvider: discovery.NewStaticProvider("unused")})
+	require.NoError(t, err, "standalone discovery requires no Kubernetes namespace")
+}
 
 func TestInitKVEventSync_FailureCleanup(t *testing.T) {
 	tests := []struct {

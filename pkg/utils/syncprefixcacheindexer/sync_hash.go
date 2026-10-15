@@ -17,6 +17,7 @@ limitations under the License.
 package syncprefixcacheindexer
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -55,8 +56,14 @@ var (
 // This ensures that all components (Store, kvSyncRouter, etc.) use the same indexer instance.
 // This follows the same pattern as GetSharedPrefixHashTable for consistency.
 func GetSharedSyncPrefixHashTable() *SyncPrefixHashTable {
+	return GetSharedSyncPrefixHashTableWithContext(context.Background())
+}
+
+// GetSharedSyncPrefixHashTableWithContext preserves the shared table while
+// assigning its eviction worker to the lifetime of its first owner.
+func GetSharedSyncPrefixHashTableWithContext(lifetime context.Context) *SyncPrefixHashTable {
 	sharedSyncOnce.Do(func() {
-		sharedSyncInstance = NewSyncPrefixHashTable()
+		sharedSyncInstance = NewSyncPrefixHashTableWithContext(lifetime)
 	})
 	return sharedSyncInstance
 }
@@ -122,6 +129,9 @@ type SyncPrefixHashTable struct {
 	evictionNeeded  atomic.Bool // Flag to trigger eviction
 	stopCh          chan struct{}
 	wg              sync.WaitGroup
+	lifetime        context.Context
+	cancel          context.CancelFunc
+	closeOnce       sync.Once
 
 	// Reverse index for efficient block removal
 	blockIndexMu sync.RWMutex
@@ -130,6 +140,13 @@ type SyncPrefixHashTable struct {
 
 // NewSyncPrefixHashTable creates a new sync prefix hash table
 func NewSyncPrefixHashTable() *SyncPrefixHashTable {
+	return NewSyncPrefixHashTableWithContext(context.Background())
+}
+
+// NewSyncPrefixHashTableWithContext owns eviction under lifetime. Close
+// cancels and awaits it; cancellation leaves cached entries readable.
+func NewSyncPrefixHashTableWithContext(lifetime context.Context) *SyncPrefixHashTable {
+	lifetime, cancel := context.WithCancel(lifetime)
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	seed := r.Uint64()
 
@@ -150,6 +167,8 @@ func NewSyncPrefixHashTable() *SyncPrefixHashTable {
 		evictionDuration:      evictionDuration,
 		stopCh:                make(chan struct{}),
 		blockIndex:            make(map[int64][]ModelContext),
+		lifetime:              lifetime,
+		cancel:                cancel,
 	}
 
 	// Start eviction worker
@@ -161,21 +180,20 @@ func NewSyncPrefixHashTable() *SyncPrefixHashTable {
 
 // Close stops the eviction worker and cleans up resources
 func (s *SyncPrefixHashTable) Close() {
-	close(s.stopCh)
-
-	// Wait for eviction worker with timeout
-	done := make(chan struct{})
-	go func() {
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		close(s.stopCh)
 		s.wg.Wait()
-		close(done)
-	}()
+	})
+}
 
-	select {
-	case <-done:
-		// Clean shutdown
-	case <-time.After(5 * time.Second):
-		klog.Warning("eviction worker shutdown timeout")
+func (s *SyncPrefixHashTable) runtimeContext() context.Context {
+	if s.lifetime != nil {
+		return s.lifetime
 	}
+	return context.Background()
 }
 
 // MatchPrefix matches the input token prefix if already cached
@@ -248,6 +266,15 @@ func (s *SyncPrefixHashTable) MatchPrefix(modelName string, loraID int64, tokens
 
 // ProcessBlockStored handles BlockStored events
 func (s *SyncPrefixHashTable) ProcessBlockStored(event BlockStored) error {
+	return s.ProcessBlockStoredContext(context.Background(), event)
+}
+
+// ProcessBlockStoredContext returns operation's error if lock acquisition is
+// canceled. Once all update locks are held, it applies the block batch together.
+func (s *SyncPrefixHashTable) ProcessBlockStoredContext(operation context.Context, event BlockStored) error {
+	if err := operation.Err(); err != nil {
+		return err
+	}
 	// Validate input
 	if len(event.BlockHashes) == 0 {
 		return nil
@@ -265,8 +292,18 @@ func (s *SyncPrefixHashTable) ProcessBlockStored(event BlockStored) error {
 	contextData := s.getOrCreateContextData(ctx)
 
 	// First, acquire mapping lock to check what needs to be done
-	contextData.mappingMu.Lock()
+	if err := utils.LockContext(operation, contextData.mappingMu.TryLock, contextData.mappingMu.Unlock); err != nil {
+		return err
+	}
 	defer contextData.mappingMu.Unlock()
+	if err := utils.LockContext(operation, contextData.prefixMu.TryLock, contextData.prefixMu.Unlock); err != nil {
+		return err
+	}
+	defer contextData.prefixMu.Unlock()
+	if err := utils.LockContext(operation, s.blockIndexMu.TryLock, s.blockIndexMu.Unlock); err != nil {
+		return err
+	}
+	defer s.blockIndexMu.Unlock()
 
 	hashMapping := contextData.hashMapping
 	prefixUpdates := make([]struct {
@@ -315,14 +352,11 @@ func (s *SyncPrefixHashTable) ProcessBlockStored(event BlockStored) error {
 		}{aibrixHash, event.SourcePod})
 
 		// Update reverse index
-		s.updateBlockIndex(engineBlockHash, ctx, true)
+		s.updateBlockIndexLocked(engineBlockHash, ctx, true)
 	}
 
 	// Now update prefix store if needed
 	if len(prefixUpdates) > 0 {
-		contextData.prefixMu.Lock()
-		defer contextData.prefixMu.Unlock()
-
 		prefixStore := contextData.prefixStore
 		for _, update := range prefixUpdates {
 			s.addPrefixToPodLocked(prefixStore, update.hash, update.pod)
@@ -339,6 +373,15 @@ func (s *SyncPrefixHashTable) ProcessBlockStored(event BlockStored) error {
 
 // ProcessBlockRemoved handles BlockRemoved events
 func (s *SyncPrefixHashTable) ProcessBlockRemoved(event BlockRemoved) error {
+	return s.ProcessBlockRemovedContext(context.Background(), event)
+}
+
+// ProcessBlockRemovedContext cancels update-lock waits through operation and
+// returns its error. After acquiring all locks, it applies removal as one batch.
+func (s *SyncPrefixHashTable) ProcessBlockRemovedContext(operation context.Context, event BlockRemoved) error {
+	if err := operation.Err(); err != nil {
+		return err
+	}
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
@@ -362,8 +405,18 @@ func (s *SyncPrefixHashTable) ProcessBlockRemoved(event BlockRemoved) error {
 	// First, resolve the affected prefixes using the mapping lock. The mapping
 	// can only be dropped once no pod holds the block, so resolve without
 	// mutating here.
-	contextData.mappingMu.Lock()
+	if err := utils.LockContext(operation, contextData.mappingMu.TryLock, contextData.mappingMu.Unlock); err != nil {
+		return err
+	}
 	defer contextData.mappingMu.Unlock()
+	if err := utils.LockContext(operation, contextData.prefixMu.TryLock, contextData.prefixMu.Unlock); err != nil {
+		return err
+	}
+	defer contextData.prefixMu.Unlock()
+	if err := utils.LockContext(operation, s.blockIndexMu.TryLock, s.blockIndexMu.Unlock); err != nil {
+		return err
+	}
+	defer s.blockIndexMu.Unlock()
 
 	toRemove := make(map[uint64][]int64) // aibrix prefix hash → engine block hashes
 	for _, engineBlockHash := range event.BlockHashes {
@@ -383,7 +436,6 @@ func (s *SyncPrefixHashTable) ProcessBlockRemoved(event BlockRemoved) error {
 			event.ModelName, event.LoraID, len(event.BlockHashes))
 	}
 	orphaned := make([]int64, 0, len(event.BlockHashes))
-	contextData.prefixMu.Lock()
 	prefixStore := contextData.prefixStore
 	prefixStore.lastAccess.Store(time.Now().Unix())
 	for aibrixHash, engineBlockHashes := range toRemove {
@@ -400,13 +452,12 @@ func (s *SyncPrefixHashTable) ProcessBlockRemoved(event BlockRemoved) error {
 		}
 		orphaned = append(orphaned, engineBlockHashes...)
 	}
-	contextData.prefixMu.Unlock()
 
 	// Finally drop the mappings no pod references any more
 	for _, engineBlockHash := range orphaned {
 		delete(contextData.hashMapping.engineToAibrix, engineBlockHash)
 		// Update reverse index
-		s.updateBlockIndex(engineBlockHash, ctx, false)
+		s.updateBlockIndexLocked(engineBlockHash, ctx, false)
 	}
 
 	return nil
@@ -468,6 +519,16 @@ func (s *SyncPrefixHashTable) AddPrefix(modelName string, loraID int64, podName 
 
 // RemovePrefix removes a specific pod from all prefix entries
 func (s *SyncPrefixHashTable) RemovePrefix(modelName string, loraID int64, podName string) error {
+	return s.RemovePrefixContext(context.Background(), modelName, loraID, podName)
+}
+
+// RemovePrefixContext cancels lock waits and checks operation between prefixes.
+// Cancellation returns its error after any prefixes already removed; retrying
+// removal is safe. This operation starts no continuing worker.
+func (s *SyncPrefixHashTable) RemovePrefixContext(operation context.Context, modelName string, loraID int64, podName string) error {
+	if err := operation.Err(); err != nil {
+		return err
+	}
 	ctx := ModelContext{
 		ModelName: modelName,
 		LoraID:    loraID,
@@ -479,13 +540,18 @@ func (s *SyncPrefixHashTable) RemovePrefix(modelName string, loraID int64, podNa
 	}
 
 	contextData := value.(*ContextData)
-	contextData.prefixMu.Lock()
+	if err := utils.LockContext(operation, contextData.prefixMu.TryLock, contextData.prefixMu.Unlock); err != nil {
+		return err
+	}
 	defer contextData.prefixMu.Unlock()
 
 	prefixStore := contextData.prefixStore
 
 	// Remove pod from all prefix entries
 	for prefixHash, pods := range prefixStore.prefixMap {
+		if err := operation.Err(); err != nil {
+			return err
+		}
 		delete(pods, podName)
 		if len(pods) == 0 {
 			delete(prefixStore.prefixMap, prefixHash)
@@ -640,6 +706,8 @@ func (s *SyncPrefixHashTable) evictionWorker() {
 			}
 		case <-s.stopCh:
 			return
+		case <-s.runtimeContext().Done():
+			return
 		}
 	}
 }
@@ -715,7 +783,9 @@ func (s *SyncPrefixHashTable) performEviction() {
 // evictExpiredPodsInBatch processes multiple contexts to remove expired pods
 func (s *SyncPrefixHashTable) evictExpiredPodsInBatch(contexts []*ContextData, expiredBefore int64) {
 	for _, contextData := range contexts {
-		contextData.prefixMu.Lock()
+		if err := utils.LockContext(s.runtimeContext(), contextData.prefixMu.TryLock, contextData.prefixMu.Unlock); err != nil {
+			return
+		}
 		prefixStore := contextData.prefixStore
 
 		for prefixHash, pods := range prefixStore.prefixMap {
@@ -792,7 +862,9 @@ func (s *SyncPrefixHashTable) enforceContextLimit(excess int) {
 // for every engine block hash the context had ever seen, and repeated
 // evict-recreate churn on one (model, lora) pair grew it without bound.
 func (s *SyncPrefixHashTable) dropContextBlockIndex(ctx ModelContext, contextData *ContextData) {
-	contextData.mappingMu.RLock()
+	if err := utils.LockContext(s.runtimeContext(), contextData.mappingMu.TryRLock, contextData.mappingMu.RUnlock); err != nil {
+		return
+	}
 	engineBlockHashes := make([]int64, 0, len(contextData.hashMapping.engineToAibrix))
 	for engineBlockHash := range contextData.hashMapping.engineToAibrix {
 		engineBlockHashes = append(engineBlockHashes, engineBlockHash)
@@ -806,8 +878,14 @@ func (s *SyncPrefixHashTable) dropContextBlockIndex(ctx ModelContext, contextDat
 
 // updateBlockIndex updates the reverse index for block to context mapping
 func (s *SyncPrefixHashTable) updateBlockIndex(blockHash int64, ctx ModelContext, add bool) {
-	s.blockIndexMu.Lock()
+	if err := utils.LockContext(s.runtimeContext(), s.blockIndexMu.TryLock, s.blockIndexMu.Unlock); err != nil {
+		return
+	}
 	defer s.blockIndexMu.Unlock()
+	s.updateBlockIndexLocked(blockHash, ctx, add)
+}
+
+func (s *SyncPrefixHashTable) updateBlockIndexLocked(blockHash int64, ctx ModelContext, add bool) {
 
 	if add {
 		contexts := s.blockIndex[blockHash]

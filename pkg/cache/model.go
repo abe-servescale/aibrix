@@ -16,6 +16,8 @@ limitations under the License.
 package cache
 
 import (
+	"context"
+
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
 	v1 "k8s.io/api/core/v1"
@@ -23,6 +25,11 @@ import (
 
 // ModelRouterProviderFunc defines the function to provider per-model router
 type ModelRouterProviderFunc func(modelName string) (types.QueueRouter, error)
+
+// ModelRouterProviderContextFunc constructs a model router using explicit cache
+// state before singleton publication. startup controls construction and waits;
+// lifetime owns any continued queue processing and its Close cleanup.
+type ModelRouterProviderContextFunc func(startup, lifetime context.Context, store *Store, modelName string) (types.QueueRouter, error)
 
 type Model struct {
 	// Pods is a CustomizedRegistry that stores *v1.Pod objects.

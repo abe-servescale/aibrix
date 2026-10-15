@@ -1,0 +1,8 @@
+# Render-time configuration. The gateway receives the resulting flag directly;
+# it does not read this ConfigMap or infer the workload namespace at runtime.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-discovery-config
+data:
+  installationNamespace: default

@@ -127,16 +127,15 @@ func AbortDecodeLegOnWatchdog(client *http.Client, leg *types.PDLegState, reques
 
 	// Not leg.AbortContext(): that context exists to stop a prefill-failure
 	// abort once the decode pod starts answering, and a watchdog abort is
-	// sent regardless of whether it has. Nothing cancels this one but its own
-	// timeout.
-	abortLaunched = true
-	go func() {
+	// sent regardless of whether it has. Its gateway lifetime and timeout still
+	// cancel the request.
+	abortLaunched = leg.StartBackground(func(ctx context.Context) {
 		defer leg.FinishDecodeAbort()
 		start := time.Now()
-		if err := postDecodeAbort(context.Background(), client, decodeAddr, rid, timeout); err != nil {
+		if err := postDecodeAbort(ctx, client, decodeAddr, rid, timeout); err != nil {
 			logAbort(1, abortResultError, time.Since(start), err)
 			return
 		}
 		logAbort(1, abortResultOK, time.Since(start), nil)
-	}()
+	})
 }

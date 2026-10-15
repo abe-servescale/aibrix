@@ -241,7 +241,9 @@ func (c *Store) takePodStats(ctx *types.RoutingContext, modelName, requestID str
 
 func (c *Store) getRequestTrace(modelName string) *RequestTrace {
 	trace := NewRequestTrace(time.Now().UnixNano())
+	c.requestTraceMu.RLock()
 	newer, loaded := c.requestTrace.LoadOrStore(modelName, trace)
+	c.requestTraceMu.RUnlock()
 	if loaded {
 		trace.Recycle()
 	} else {
@@ -258,12 +260,16 @@ func (c *Store) getRequestTrace(modelName string) *RequestTrace {
 // attempted (and only decrementing if it actually succeeded) -- see podStatsRecord's
 // doc comment.
 func (c *Store) decrCrossGatewayRunningRequests(podStats *podStatsRecord, namespace, name string) {
-	go func() {
-		<-podStats.runningReqIncrDone
+	c.startOwnedTask(func() {
+		select {
+		case <-podStats.runningReqIncrDone:
+		case <-c.runtimeContext().Done():
+			return
+		}
 		if podStats.runningReqIncrOK {
 			c.decrPodRunningRequests(namespace, name)
 		}
-	}()
+	})
 }
 
 func (c *Store) addPodStats(ctx *types.RoutingContext, requestID string, modelName string) {
@@ -337,10 +343,12 @@ func (c *Store) addPodStats(ctx *types.RoutingContext, requestID string, modelNa
 		podStats.runningReqIncrOK = true
 		close(podStats.runningReqIncrDone)
 	} else {
-		go func() {
+		if !c.startOwnedTask(func() {
 			defer close(podStats.runningReqIncrDone)
 			podStats.runningReqIncrOK = c.incrPodRunningRequests(namespace, name)
-		}()
+		}) {
+			close(podStats.runningReqIncrDone)
+		}
 	}
 
 	// Update pending load. GetConsumption runs unlocked -- it can be slow (e.g. a GPU
@@ -497,11 +505,30 @@ func (c *Store) donePodStats(ctx *types.RoutingContext, requestID string, modelN
 	}
 }
 
+// flushTraceTick writes the owning Store's collected traces for this tick.
+func (c *Store) flushTraceTick(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil || atomic.LoadInt32(&c.numRequestsTraces) == 0 {
+		return
+	}
+	stamp := now.Unix()
+	round := stamp - stamp%int64(RequestTraceWriteInterval/time.Second)
+	c.writeRequestTraceToStorageWithContext(ctx, round)
+}
+
 func (c *Store) writeRequestTraceToStorage(roundT int64) {
+	c.writeRequestTraceToStorageWithContext(context.Background(), roundT)
+}
+
+func (c *Store) writeRequestTraceToStorageWithContext(ctx context.Context, roundT int64) {
+	if ctx.Err() != nil {
+		return
+	}
 	// Save and reset trace context, atomicity is guaranteed.
 	var requestTrace *utils.SyncMap[string, *RequestTrace]
 	numTraces := atomic.LoadInt32(&c.numRequestsTraces)
+	c.requestTraceMu.Lock()
 	requestTrace, c.requestTrace = c.requestTrace, &utils.SyncMap[string, *RequestTrace]{}
+	c.requestTraceMu.Unlock()
 	numResetTo := int32(0)
 	// TODO: Adding a unit test here.
 	for !atomic.CompareAndSwapInt32(&c.numRequestsTraces, numTraces, numResetTo) {
@@ -513,7 +540,9 @@ func (c *Store) writeRequestTraceToStorage(roundT int64) {
 	requestTrace.Range(func(modelName string, trace *RequestTrace) bool {
 		requestTrace.Store(modelName, nil) // Simply assign nil instead of delete
 
-		trace.Lock()
+		if err := utils.LockContext(ctx, trace.mu.TryLock, trace.mu.Unlock); err != nil {
+			return false
+		}
 		pending := 0
 		queueing := 0
 		if meta, loaded := c.metaModels.Load(modelName); loaded {
@@ -533,7 +562,7 @@ func (c *Store) writeRequestTraceToStorage(roundT int64) {
 		}
 
 		key := fmt.Sprintf("aibrix:%v_request_trace_%v", modelName, roundT)
-		if _, err = c.redisClient.Set(context.Background(), key, value, expireWriteRequestTraceIntervalInMins*time.Minute).Result(); err != nil {
+		if _, err = c.redisClient.Set(ctx, key, value, expireWriteRequestTraceIntervalInMins*time.Minute).Result(); err != nil {
 			klog.Error(err)
 		}
 		return true
@@ -543,7 +572,9 @@ func (c *Store) writeRequestTraceToStorage(roundT int64) {
 }
 
 func (c *Store) DumpRequestTrace(modelName string) map[string]int {
+	c.requestTraceMu.RLock()
 	trace, ok := c.requestTrace.Load(modelName)
+	c.requestTraceMu.RUnlock()
 	if !ok {
 		return nil
 	} else {

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	v1alpha1 "github.com/vllm-project/aibrix/pkg/client/clientset/versioned"
+	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 const (
@@ -55,6 +57,8 @@ type sourceVersions struct {
 // them against a current Kubernetes snapshot when the last proof expires.
 // Its lock also makes the health decision and model-list read one snapshot.
 type ModelListHealth struct {
+	interrupted  atomic.Bool
+	inflight     atomic.Int64
 	mu           sync.RWMutex
 	verifyMu     sync.Mutex
 	applied      sourceVersions
@@ -85,31 +89,67 @@ func objectIdentity(obj metav1.Object) (string, objectVersion) {
 // Apply holds the health read barrier while a required-source event changes
 // the derived cache. A failed handler cannot advance the applied record.
 func (h *ModelListHealth) Apply(ev WatchEvent, handler func(WatchEvent) bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	_, _ = h.ApplyContext(context.Background(), ev, func(_ context.Context, ev WatchEvent) (bool, error) { return handler(ev), nil })
+}
+
+// ApplyContext preserves health-before-store lock order while allowing startup
+// and lifetime cancellation to interrupt both barrier and cache-handler waits.
+// Interrupted events never advance the UID/resource-version snapshot.
+func (h *ModelListHealth) ApplyContext(ctx context.Context, ev WatchEvent, handler func(context.Context, WatchEvent) (bool, error)) (bool, error) {
+	return h.ApplyContextWithCompletion(ctx, ev, handler, nil)
+}
+
+// ApplyContextWithCompletion changes membership under the health barrier,
+// releases it for cancellable I/O, then records the event only after completion.
+// Verification cannot publish a healthy proof while an event is in flight.
+func (h *ModelListHealth) ApplyContextWithCompletion(ctx context.Context, ev WatchEvent, handler func(context.Context, WatchEvent) (bool, error), complete func(context.Context, WatchEvent) error) (bool, error) {
+	if err := utils.LockContext(ctx, h.mu.TryLock, h.mu.Unlock); err != nil {
+		h.interrupted.Store(true)
+		return false, err
+	}
 	var versions map[string]objectVersion
 	var obj metav1.Object
 	switch typed := ev.Object.(type) {
 	case *v1.Pod:
-		if typed == nil {
-			h.invalidateLocked()
-			return
+		if typed != nil {
+			versions, obj = h.applied.pods, typed
 		}
-		versions, obj = h.applied.pods, typed
 	case *modelv1alpha1.ModelAdapter:
-		if typed == nil {
-			h.invalidateLocked()
-			return
+		if typed != nil {
+			versions, obj = h.applied.adapters, typed
 		}
-		versions, obj = h.applied.adapters, typed
-	default:
-		h.invalidateLocked()
-		return
 	}
-	// The cache handler may dereference the object, so validate it first.
-	if !handler(ev) {
+	if obj == nil {
 		h.invalidateLocked()
-		return
+		h.mu.Unlock()
+		return false, nil
+	}
+	h.inflight.Add(1)
+	defer h.inflight.Add(-1)
+	applied, err := handler(ctx, ev)
+	if err == nil {
+		err = ctx.Err()
+	}
+	if !applied || err != nil {
+		h.invalidateLocked()
+		h.mu.Unlock()
+		return false, err
+	}
+	h.mu.Unlock()
+	if complete != nil {
+		err = complete(ctx, ev)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if lockErr := utils.LockContext(ctx, h.mu.TryLock, h.mu.Unlock); lockErr != nil {
+		h.interrupted.Store(true)
+		return false, lockErr
+	}
+	defer h.mu.Unlock()
+	if err != nil {
+		h.invalidateLocked()
+		return false, err
 	}
 	key, version := objectIdentity(obj)
 	if ev.Type == EventDelete {
@@ -117,6 +157,17 @@ func (h *ModelListHealth) Apply(ev WatchEvent, handler func(WatchEvent) bool) {
 	} else {
 		versions[key] = version
 	}
+	return true, nil
+}
+
+// InvalidateContext prevents a reported watch failure from blocking shutdown.
+func (h *ModelListHealth) InvalidateContext(ctx context.Context) {
+	if err := utils.LockContext(ctx, h.mu.TryLock, h.mu.Unlock); err != nil {
+		h.interrupted.Store(true)
+		return
+	}
+	defer h.mu.Unlock()
+	h.invalidateLocked()
 }
 
 // Invalidate causes the next request to verify immediately after a reported
@@ -147,78 +198,111 @@ func equalVersions(a, b map[string]objectVersion) bool {
 }
 
 func (h *ModelListHealth) verificationState(now time.Time) (fresh, retryLater bool, epoch uint64) {
-	h.mu.RLock()
+	fresh, retryLater, epoch, _ = h.verificationStateContext(context.Background(), now)
+	return
+}
+
+func (h *ModelListHealth) verificationStateContext(ctx context.Context, now time.Time) (fresh, retryLater bool, epoch uint64, err error) {
+	if err = utils.LockContext(ctx, h.mu.TryRLock, h.mu.RUnlock); err != nil {
+		return
+	}
 	defer h.mu.RUnlock()
-	return !h.lastVerified.IsZero() && now.Sub(h.lastVerified) < h.maxAge,
-		now.Before(h.retryAfter), h.errorEpoch
+	return h.inflight.Load() == 0 && !h.lastVerified.IsZero() && now.Sub(h.lastVerified) < h.maxAge, now.Before(h.retryAfter), h.errorEpoch, nil
 }
 
 // EnsureVerified checks a complete current snapshot at most once per maxAge.
-// A failed check returns an error and is retried only after a short delay.
-// No Kubernetes request is made while the previous proof is still fresh.
+// Its timeout includes lock waits and I/O. Client cancellation does not delay
+// verification for another client or change a previously valid proof.
 func (h *ModelListHealth) EnsureVerified(ctx context.Context) error {
-	if fresh, retryLater, _ := h.verificationState(time.Now()); fresh {
-		return nil
-	} else if retryLater {
-		return ErrModelListDiscoveryUnavailable
-	}
-
-	h.verifyMu.Lock()
-	defer h.verifyMu.Unlock()
-	if fresh, retryLater, _ := h.verificationState(time.Now()); fresh {
-		return nil
-	} else if retryLater {
-		return ErrModelListDiscoveryUnavailable
-	}
-	_, _, epoch := h.verificationState(time.Now())
-	if h.snapshot == nil {
-		return ErrModelListDiscoveryUnavailable
-	}
 	checkCtx, cancel := context.WithTimeout(ctx, modelListVerificationTimeout)
 	defer cancel()
+	if err := checkCtx.Err(); err != nil {
+		return err
+	}
+	if h.interrupted.Load() {
+		return ErrModelListDiscoveryUnavailable
+	}
+	fresh, retryLater, _, err := h.verificationStateContext(checkCtx, time.Now())
+	if err != nil {
+		return err
+	}
+	if fresh {
+		return nil
+	}
+	if retryLater {
+		return ErrModelListDiscoveryUnavailable
+	}
+	if err := utils.LockContext(checkCtx, h.verifyMu.TryLock, h.verifyMu.Unlock); err != nil {
+		return err
+	}
+	defer h.verifyMu.Unlock()
+	fresh, retryLater, epoch, err := h.verificationStateContext(checkCtx, time.Now())
+	if err != nil {
+		return err
+	}
+	if fresh {
+		return nil
+	}
+	if retryLater || h.snapshot == nil {
+		return ErrModelListDiscoveryUnavailable
+	}
 	started := time.Now()
-	current, err := h.snapshot(checkCtx)
-
-	h.mu.Lock()
+	current, snapshotErr := h.snapshot(checkCtx)
+	if err := utils.LockContext(checkCtx, h.mu.TryLock, h.mu.Unlock); err != nil {
+		return err
+	}
 	defer h.mu.Unlock()
-	if err == nil && epoch == h.errorEpoch &&
-		equalVersions(current.pods, h.applied.pods) &&
-		equalVersions(current.adapters, h.applied.adapters) {
-		// The LIST snapshot may be as old as the request start. Count the
-		// freshness bound from that point, not from response completion.
+	if snapshotErr == nil && h.inflight.Load() == 0 && epoch == h.errorEpoch && equalVersions(current.pods, h.applied.pods) && equalVersions(current.adapters, h.applied.adapters) {
 		h.lastVerified = started
 		h.retryAfter = time.Time{}
 		return nil
 	}
 	h.lastVerified = time.Time{}
-	if ctx.Err() != nil {
-		// A client cancel must not delay verification for other clients.
-		h.retryAfter = time.Time{}
-	} else {
-		h.retryAfter = time.Now().Add(modelListVerificationRetry)
-	}
-	if err != nil {
-		return fmt.Errorf("verify model discovery: %w", err)
+	h.retryAfter = time.Now().Add(modelListVerificationRetry)
+	if snapshotErr != nil {
+		return fmt.Errorf("verify model discovery: %w", snapshotErr)
 	}
 	return ErrModelListDiscoveryUnavailable
 }
 
-// ModelsIfHealthy runs list while required-source event handlers are blocked.
-// This keeps the health decision and model-list read in the same snapshot.
+// ModelsIfHealthy retains the context-free interface for legacy callers.
 func (h *ModelListHealth) ModelsIfHealthy(list func() []string) ([]string, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	if h.lastVerified.IsZero() || time.Since(h.lastVerified) >= h.maxAge {
-		return nil, false
+	models, healthy, _ := h.ModelsIfHealthyContext(context.Background(), func(context.Context) ([]string, error) { return list(), nil })
+	return models, healthy
+}
+
+// ModelsIfHealthyContext takes a cancellable health snapshot and invokes a
+// cancellable Store reader under the same barrier, in health-before-store order.
+func (h *ModelListHealth) ModelsIfHealthyContext(ctx context.Context, list func(context.Context) ([]string, error)) ([]string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
-	return list(), true
+	if h.interrupted.Load() {
+		return nil, false, nil
+	}
+	if err := utils.LockContext(ctx, h.mu.TryRLock, h.mu.RUnlock); err != nil {
+		return nil, false, err
+	}
+	defer h.mu.RUnlock()
+	if h.inflight.Load() != 0 || h.lastVerified.IsZero() || time.Since(h.lastVerified) >= h.maxAge {
+		return nil, false, nil
+	}
+	models, err := list(ctx)
+	if err == nil {
+		err = ctx.Err()
+	}
+	return models, err == nil, err
 }
 
 func listPodVersions(ctx context.Context, client kubernetes.Interface) (map[string]objectVersion, error) {
+	return listPodVersionsForNamespace(ctx, client, metav1.NamespaceAll)
+}
+
+func listPodVersionsForNamespace(ctx context.Context, client kubernetes.Interface, namespace string) (map[string]objectVersion, error) {
 	versions := make(map[string]objectVersion)
 	opts := metav1.ListOptions{Limit: modelListPageSize}
 	for {
-		page, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, opts)
+		page, err := client.CoreV1().Pods(namespace).List(ctx, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -237,10 +321,14 @@ func listPodVersions(ctx context.Context, client kubernetes.Interface) (map[stri
 }
 
 func listAdapterVersions(ctx context.Context, client v1alpha1.Interface) (map[string]objectVersion, error) {
+	return listAdapterVersionsForNamespace(ctx, client, metav1.NamespaceAll)
+}
+
+func listAdapterVersionsForNamespace(ctx context.Context, client v1alpha1.Interface, namespace string) (map[string]objectVersion, error) {
 	versions := make(map[string]objectVersion)
 	opts := metav1.ListOptions{Limit: modelListPageSize}
 	for {
-		page, err := client.ModelV1alpha1().ModelAdapters(metav1.NamespaceAll).List(ctx, opts)
+		page, err := client.ModelV1alpha1().ModelAdapters(namespace).List(ctx, opts)
 		if err != nil {
 			return nil, err
 		}

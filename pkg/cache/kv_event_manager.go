@@ -35,7 +35,7 @@ type KVEventManager struct {
 
 // NewKVEventManager creates a stub KV event manager
 func NewKVEventManager(store *Store) *KVEventManager {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(store.runtimeContext())
 	return &KVEventManager{
 		store:   store,
 		enabled: false,
@@ -55,7 +55,7 @@ func (m *KVEventManager) Start() error {
 	return nil
 }
 
-// Stop is a no-op
+// Stop cancels the stub lifecycle; there is no worker to await.
 func (m *KVEventManager) Stop() {
 	m.cancel()
 }
@@ -75,3 +75,17 @@ func (m *KVEventManager) OnPodDelete(pod *v1.Pod) {}
 // have.
 func (m *KVEventManager) CheckSleepStateBackstop(ctx context.Context, podKey, modelName string, loraID int64, awake float64) {
 }
+
+// OnPodAddContext returns caller cancellation without creating a subscription
+// in this build. It starts no continuing work and needs no event cleanup.
+func (m *KVEventManager) OnPodAddContext(ctx context.Context, pod *v1.Pod) error { return ctx.Err() }
+
+// OnPodUpdateContext returns caller cancellation and otherwise leaves this
+// unsupported subscription state unchanged, without starting work.
+func (m *KVEventManager) OnPodUpdateContext(ctx context.Context, oldPod, newPod *v1.Pod) error {
+	return ctx.Err()
+}
+
+// OnPodDeleteContext returns caller cancellation. No subscriber or indexed
+// state exists to remove in this build.
+func (m *KVEventManager) OnPodDeleteContext(ctx context.Context, pod *v1.Pod) error { return ctx.Err() }

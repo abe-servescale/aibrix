@@ -42,6 +42,7 @@ in ``config/gateway/gateway-plugin/gateway-plugin.yaml``:
     containers:
       - name: gateway-plugin
         args:
+          - --installation-namespace=default
           - --kube-api-qps=5
           - --kube-api-burst=10
 
@@ -59,6 +60,106 @@ caches. These flags control API server traffic, not inference request QPS.
 Gateway Plugin Model Discovery and Listing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Kubernetes mode requires one explicit workload namespace:
+
+.. code-block:: yaml
+
+    containers:
+      - name: gateway-plugin
+        args:
+          - --installation-namespace=default
+
+The plugin lists and watches Pods, enabled ModelAdapters, and optional
+ModelClaims only in this namespace. Model-list verification uses the same
+namespace on every page. Foreign objects cannot enter the discovery cache,
+even if they advertise an identical model name. Model names retain their
+existing exact spelling: a nonempty ``model.aibrix.ai/name`` label takes
+precedence over the annotation of the same name. Routing and ``/v1/models``
+read the same model cache.
+
+There is no all-namespaces default. Missing, empty, invalid, inaccessible,
+nonexistent, or terminating namespaces fail startup. The plugin checks actual
+LIST and WATCH access for required discovery sources and allows 30 seconds
+for discovery and gateway setup. It publishes neither a successful model list
+nor serving readiness before initialization completes. The early HTTP listener
+returns HTTP 503 while Kubernetes discovery is starting.
+
+The packaged Kustomize manifests and Helm chart select ``default`` as the
+workload namespace, matching the quickstart model deployments. This setting
+is independent of the gateway control namespace (normally ``aibrix-system``).
+The workload namespace must exist before the gateway starts.
+
+Discovery uses a Role and RoleBinding in the workload namespace. A separate
+ClusterRole grants only ``get`` on that exact Namespace. Pod ``patch`` access
+for model wake-up has its own workload Role; HTTPRoute ``get`` access has its
+own Role in the gateway control namespace. Controller permissions are unchanged.
+
+For Helm, set the workload namespace once in your values:
+
+.. code-block:: yaml
+
+    gatewayPlugin:
+      installationNamespace: models
+
+The chart uses this value for both the flag and RBAC. ``--namespace`` still
+selects the control namespace for the Helm release. Both the Envoy Gateway
+and Envoy sidecar configurations use these grants.
+
+For Kustomize, ``config/gateway/discovery-namespace/config.yaml`` supplies
+``data.installationNamespace``. For a custom overlay, patch this ConfigMap
+and run the replacement transformer at the outermost level, after the
+overlay's namespace transformation:
+
+.. code-block:: yaml
+
+    apiVersion: kustomize.config.k8s.io/v1beta1
+    kind: Kustomization
+    namespace: aibrix-system
+    resources:
+      - ../../default
+    patches:
+      - target:
+          kind: ConfigMap
+          name: gateway-discovery-config
+        patch: |-
+          - op: replace
+            path: /data/installationNamespace
+            value: models
+    transformers:
+      - ../../gateway/discovery-namespace/transformer
+
+This example belongs in ``config/overlays/custom``. The transformer updates
+the gateway argument, workload Role/RoleBinding namespaces, Namespace GET
+grant, and ServiceAccount subjects together. The development gateway overlays
+also include these grants.
+
+When upgrading an existing installation, stop the old gateway replicas and
+remove their old cluster-wide discovery binding before starting the scoped
+version. Applying a RoleBinding does not delete a ClusterRoleBinding of the
+same name. For the default installation:
+
+.. code-block:: bash
+
+    kubectl -n aibrix-system scale deployment aibrix-gateway-plugins --replicas=0
+    kubectl delete clusterrolebinding aibrix-gateway-plugins-rolebinding
+    kubectl delete clusterrole aibrix-gateway-plugins-role
+
+For a Helm installation, stop the gateway and remove the old chart grant
+before upgrading (replace ``aibrix`` with the chart's rendered fullname):
+
+.. code-block:: bash
+
+    kubectl -n aibrix-system scale deployment aibrix-gateway-plugins --replicas=0
+    kubectl delete clusterrolebinding aibrix-gateway-plugins
+    kubectl delete clusterrole aibrix-gateway-plugins
+
+Apply the updated RBAC and deployment, then restore the desired replica count.
+Also remove any custom binding that grants the gateway cluster-wide workload
+access. Verify that its ServiceAccount can list/watch workload resources in
+the configured namespace and cannot do so in another namespace or cluster-wide.
+Static ``--standalone`` discovery and non-gateway discovery retain their
+existing behavior.
+
 The plugin can omit Kubernetes resource types that it does not serve. The
 following options keep Pod discovery and select a list containing only models
 with a ready Pod:
@@ -68,6 +169,7 @@ with a ready Pod:
     containers:
       - name: gateway-plugin
         args:
+          - --installation-namespace=default
           - --watch-model-adapters=false
           - --watch-model-claims=false
           - --model-list-mode=ready-pods
@@ -92,6 +194,7 @@ set a positive ``--model-list-discovery-max-age`` duration. For example:
     containers:
       - name: gateway-plugin
         args:
+          - --installation-namespace=default
           - --model-list-mode=ready-pods
           - --model-list-discovery-max-age=5m
 
@@ -108,7 +211,7 @@ with no models still returns HTTP 200 with an empty list. Each gateway replica
 performs its own verification, so choose the duration with API-server load in
 mind. The verification request has a ten-second timeout.
 
-With verification enabled, the plugin opens its HTTP listener before initial
+In Kubernetes mode, the plugin opens its HTTP listener before initial
 discovery completes and returns the same 503 while its cache is unavailable.
 This only covers requests that reach the plugin; when no gateway process or
 ready Service endpoint is reachable, the front proxy controls the response.

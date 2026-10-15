@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync/atomic"
@@ -92,12 +93,32 @@ func (c *Store) ListModels() []string {
 // non-terminating, non-draining Pod. The cache lock keeps model membership and
 // Pod updates in the same snapshot while the list is built.
 func (c *Store) ListModelsWithReadyPods() []string {
-	c.mu.RLock()
+	models, _ := c.ListModelsContext(context.Background(), true)
+	return models
+}
+
+// ListModelsContext bounds membership snapshot reads by the request lifetime.
+func (c *Store) ListModelsContext(ctx context.Context, readyPods bool) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !readyPods {
+		return c.ListModels(), ctx.Err()
+	}
+	if err := utils.LockContext(ctx, c.mu.TryRLock, c.mu.RUnlock); err != nil {
+		return nil, err
+	}
 	defer c.mu.RUnlock()
 
 	models := make([]string, 0, c.metaModels.Len())
 	c.metaModels.Range(func(name string, meta *Model) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		for _, pod := range meta.Pods.Array().All() {
+			if ctx.Err() != nil {
+				return false
+			}
 			if pod != nil && utils.FilterReadyPod(pod) {
 				models = append(models, name)
 				break
@@ -106,7 +127,7 @@ func (c *Store) ListModelsWithReadyPods() []string {
 		return true
 	})
 	sort.Strings(models)
-	return models
+	return models, ctx.Err()
 }
 
 // HasModel checks if a model exists in the cache

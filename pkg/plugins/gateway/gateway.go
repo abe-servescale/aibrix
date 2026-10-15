@@ -74,6 +74,9 @@ type httpRouteCacheEntry struct {
 }
 
 type Server struct {
+	lifetimeCtx         context.Context
+	ownedRouterManager  bool
+	cancelOwnedWork     context.CancelFunc
 	redisClient         *redis.Client
 	ratelimiter         ratelimiter.RateLimiter
 	modelRateLimiter    ratelimiter.RateLimiter
@@ -266,8 +269,10 @@ const (
 
 // ServerOptions configures optional dependencies for a Server.
 type ServerOptions struct {
-	Cache         cache.Cache
-	RouterManager *routing.RouterManager
+	// LifetimeContext closes serving immediately after gateway shutdown.
+	LifetimeContext context.Context
+	Cache           cache.Cache
+	RouterManager   *routing.RouterManager
 	// ModelListMode defaults to ModelListKnown.
 	ModelListMode ModelListMode
 	// VerifyModelList returns 503 when a current discovery snapshot cannot be
@@ -295,12 +300,29 @@ func NewServer(redisClient *redis.Client, client kubernetes.Interface, gatewayCl
 // A supplied Cache without a RouterManager creates an isolated cache-aware
 // manager; with no options, production global cache and routing behavior apply.
 func NewServerWithOptions(redisClient *redis.Client, client kubernetes.Interface, gatewayClient gatewayapi.Interface, options ServerOptions) *Server {
+	server, err := newServerWithContext(context.Background(), redisClient, client, gatewayClient, options, true)
+	if err != nil {
+		panic(err)
+	}
+	return server
+}
+
+// NewServerWithContext cancels router initialization under the startup budget.
+// It returns configuration or cancellation errors without publishing a handler.
+func NewServerWithContext(ctx context.Context, redisClient *redis.Client, client kubernetes.Interface, gatewayClient gatewayapi.Interface, options ServerOptions) (*Server, error) {
+	return newServerWithContext(ctx, redisClient, client, gatewayClient, options, false)
+}
+
+func newServerWithContext(ctx context.Context, redisClient *redis.Client, client kubernetes.Interface, gatewayClient gatewayapi.Interface, options ServerOptions, legacy bool) (*Server, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c := options.Cache
 	if c == nil {
 		var err error
 		c, err = cache.Get()
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 	}
 	mode := options.ModelListMode
@@ -311,14 +333,14 @@ func NewServerWithOptions(redisClient *redis.Client, client kubernetes.Interface
 	case ModelListKnown:
 	case ModelListReadyPods:
 		if _, ok := c.(cache.ReadyModelCache); !ok {
-			panic("ready-pods model listing requires a cache that supports ready model snapshots")
+			return nil, errors.New("ready-pods model listing requires a cache that supports ready model snapshots")
 		}
 	default:
-		panic(fmt.Sprintf("unsupported model list mode %q", mode))
+		return nil, fmt.Errorf("unsupported model list mode %q", mode)
 	}
 	if options.VerifyModelList {
 		if _, ok := c.(cache.VerifiedModelCache); !ok {
-			panic("verified model listing requires a cache that supports discovery verification")
+			return nil, errors.New("verified model listing requires a cache that supports discovery verification")
 		}
 	}
 	var r ratelimiter.RateLimiter
@@ -334,19 +356,45 @@ func NewServerWithOptions(redisClient *redis.Client, client kubernetes.Interface
 	routerManager := options.RouterManager
 	if routerManager == nil {
 		if options.Cache != nil {
-			routerManager = routing.NewRouterManagerWithCache(c)
+			var err error
+			routerManager, err = routing.NewRouterManagerWithCacheContext(ctx, c, nil)
+			if err != nil {
+				return nil, err
+			}
 		} else {
-			routing.Init()
 			routerManager = routing.DefaultRouterManager()
 		}
 	}
-	routerManager.Init()
+	lifetime := options.LifetimeContext
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	ownedManager := !legacy
+	var cancelOwned context.CancelFunc
+	if ownedManager {
+		lifetime, cancelOwned = context.WithCancel(lifetime)
+	}
+	success := false
+	defer func() {
+		if !success && ownedManager {
+			cancelOwned()
+			routerManager.Close()
+		}
+	}()
+	if legacy {
+		routerManager.Init()
+	} else if err := routerManager.InitWithLifetimeContext(ctx, lifetime); err != nil {
+		return nil, err
+	}
 	if err := routerManager.InitializationError(routing.RouterExternal); err != nil && !errors.Is(err, routing.ErrExternalRouterDisabled) {
-		panic(fmt.Errorf("invalid external router configuration: %w", err))
+		return nil, fmt.Errorf("invalid external router configuration: %w", err)
 	}
 
 	shutdown := make(chan struct{})
 	s := &Server{
+		lifetimeCtx:         options.LifetimeContext,
+		ownedRouterManager:  ownedManager,
+		cancelOwnedWork:     cancelOwned,
 		redisClient:         redisClient,
 		ratelimiter:         r,
 		modelRateLimiter:    mr,
@@ -367,16 +415,33 @@ func NewServerWithOptions(redisClient *redis.Client, client kubernetes.Interface
 		shutdownCh:          shutdown,
 		shutdown:            shutdown,
 	}
+	if ownedManager {
+		s.lifetimeCtx = lifetime
+	}
 	s.asyncJobs = newAsyncJobRegistryForClient(redisClient, c)
 	if sar, err := routerManager.Lookup(routing.RouterSessionAffinity); err == nil {
-		if rb, ok := sar.(routing.RedisBackedRouter); ok {
+		if ownedManager {
+			if managed, ok := sar.(interface {
+				StartWithContext(context.Context, *redis.Client)
+			}); ok {
+				managed.StartWithContext(lifetime, redisClient)
+			}
+		} else if rb, ok := sar.(routing.RedisBackedRouter); ok {
 			rb.Start(shutdown, redisClient)
 		}
 	}
-	return s
+	if err := ctx.Err(); err != nil {
+		s.Shutdown()
+		return nil, err
+	}
+	success = true
+	return s, nil
 }
 
 func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) (err error) {
+	if s.lifetimeCtx != nil && s.lifetimeCtx.Err() != nil {
+		return fmt.Errorf("gateway is shutting down: %w", s.lifetimeCtx.Err())
+	}
 	// Process is also reachable without the server's stream interceptor, so it
 	// recovers panics on its own as well.
 	defer func() {
@@ -1037,6 +1102,16 @@ func startModelListHTTPServer(addr string, handler http.HandlerFunc) (*http.Serv
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	if s.lifetimeCtx != nil {
+		operation, cancel := context.WithCancel(r.Context())
+		stop := context.AfterFunc(s.lifetimeCtx, cancel)
+		defer func() { stop(); cancel() }()
+		r = r.WithContext(operation)
+	}
+	if s.lifetimeCtx != nil && s.lifetimeCtx.Err() != nil {
+		writeModelListUnavailable(w)
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1064,6 +1139,15 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			writeModelListUnavailable(w)
 			return
 		}
+	} else if contextual, ok := s.cache.(interface {
+		ListModelsContext(context.Context, bool) ([]string, error)
+	}); ok {
+		var err error
+		models, err = contextual.ListModelsContext(r.Context(), s.modelListMode == ModelListReadyPods)
+		if err != nil {
+			writeModelListUnavailable(w)
+			return
+		}
 	} else if s.modelListMode == ModelListReadyPods {
 		models = s.cache.(cache.ReadyModelCache).ListModelsWithReadyPods()
 	} else {
@@ -1073,6 +1157,10 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	for i, m := range models {
 		data[i] = modelObject{ID: m, Object: "model", Created: 0, OwnedBy: "aibrix"}
 	}
+	if s.lifetimeCtx != nil && s.lifetimeCtx.Err() != nil {
+		writeModelListUnavailable(w)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(modelListResponse{Object: "list", Data: data}); err != nil {
@@ -1081,6 +1169,12 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Shutdown() {
+	if s.cancelOwnedWork != nil {
+		s.cancelOwnedWork()
+	}
+	if s.ownedRouterManager {
+		s.routerManager.Close()
+	}
 	if s.shutdown != nil {
 		s.shutdownOnce.Do(func() { close(s.shutdown) })
 	}
