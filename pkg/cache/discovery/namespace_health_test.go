@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestNamespaceEventGuardLeavesHealthVersionsUnchanged(t *testing.T) {
@@ -48,7 +49,16 @@ func TestNamespaceEventGuardLeavesHealthVersionsUnchanged(t *testing.T) {
 	foreign.Namespace = "foreign"
 	foreign.UID = "foreign"
 	foreign.ResourceVersion = "9"
-	for _, event := range []WatchEvent{{Type: EventAdd, Object: foreign}, {Type: EventDelete, Object: foreign}, {Type: EventUpdate, Object: inside, OldObject: foreign}, {Type: EventUpdate, Object: foreign, OldObject: inside}} {
+	for _, event := range []WatchEvent{
+		{Type: EventAdd, Object: foreign}, {Type: EventDelete, Object: foreign},
+		{Type: EventDelete, Object: cache.DeletedFinalStateUnknown{Obj: foreign}},
+		{Type: EventDelete, Object: &cache.DeletedFinalStateUnknown{Obj: foreign}},
+		{Type: EventUpdate, Object: inside, OldObject: foreign},
+		{Type: EventUpdate, Object: foreign, OldObject: inside},
+		{Type: EventAdd, Object: &modelv1alpha1.ModelAdapter{ObjectMeta: foreign.ObjectMeta}},
+		{Type: EventAdd, Object: &modelv1alpha1.ModelClaim{ObjectMeta: foreign.ObjectMeta}},
+		{Type: EventAdd, Object: (*v1.Pod)(nil)},
+	} {
 		before := calls.Load()
 		applied, err := p.DispatchNamespaced(context.Background(), event, true, handler)
 		require.NoError(t, err)

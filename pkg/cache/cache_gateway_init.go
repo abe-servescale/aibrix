@@ -78,17 +78,17 @@ func InitGatewayWithOptions(startupCtx, lifetimeCtx context.Context, config *res
 	if store.initialized {
 		return nil, fmt.Errorf("cannot reuse an unconfined cache for the Kubernetes gateway")
 	}
-	runCtx, cancel := context.WithCancel(lifetimeCtx)
-	stopOnDeadline := context.AfterFunc(startupCtx, cancel)
+	owner := utils.NewOwnedTasks(lifetimeCtx)
+	runCtx := owner.Context()
+	stopOnDeadline := context.AfterFunc(startupCtx, owner.Cancel)
 	defer stopOnDeadline()
 	st := newStore(opts.RedisClient, nil, nil)
 	st.installationNamespace = opts.InstallationNamespace
 	st.lifetimeCtx = runCtx
-	st.cancelLifetime = cancel
+	st.ownedTasks = owner
 	st.contextRouterProvider = opts.ModelRouterProviderWithContext
-	st.redisClient = opts.RedisClient
 	st.disableModelClaimBindings = opts.DisableModelClaimPodBindings
-	st.gatewayCleanup = func() { cancel(); provider.Shutdown() }
+	st.gatewayCleanup = provider.Shutdown
 	provider.WithEventPreparation(st.prepareEventRouters).WithEventCompletion(st.notifyKVEvent)
 	defer func() {
 		if err != nil {
@@ -180,6 +180,9 @@ func (s *Store) prepareModelRouter(ctx context.Context, name string) error {
 }
 
 func handleDiscoveryObjectContext(ctx context.Context, st *Store, ev discovery.WatchEvent) (bool, error) {
+	if st.installationNamespace != "" && !ev.InNamespace(st.installationNamespace) {
+		return false, nil
+	}
 	var err error
 	switch obj := ev.Object.(type) {
 	case *v1.Pod:
@@ -237,38 +240,46 @@ func (s *Store) StartGatewayBackground(opts InitOptions) error {
 		for worker := 0; worker < s.podMetricsWorkerCount; worker++ {
 			s.startOwnedTask(func() { s.workerContext(s.lifetimeCtx, s.podMetricsJobs) })
 		}
-		initMetricsCache(s, s.lifetimeCtx.Done())
-		if s.enableProfileCaching {
-			initProfileCache(s, s.lifetimeCtx.Done(), false)
-		}
-		if s.enableTracing && s.redisClient != nil {
-			initTraceCache(s, s.lifetimeCtx.Done())
-		}
-		if s.redisClient != nil {
-			initGatewaySnapshotSync(s, s.lifetimeCtx.Done())
-			initRunningRequestsLiveness(s, s.lifetimeCtx.Done())
-		}
-		if opts.EnableKVSync {
-			if err := s.initKVEventSync(); err != nil {
-				klog.ErrorS(err, "Initialize KV event synchronization")
-			}
-		}
+		_ = s.startBackground(opts, s.lifetimeCtx.Done())
 	})
 	return s.lifetimeCtx.Err()
 }
 
+// startBackground shares component setup across Kubernetes, static discovery,
+// and metadata/controller callers. Gateway callers start it only after readiness.
+func (s *Store) startBackground(opts InitOptions, stopCh <-chan struct{}) error {
+	if opts.EnableKVSync && opts.RedisClient == nil {
+		return fmt.Errorf("KV event synchronization requires Redis")
+	}
+	initMetricsCache(s, stopCh)
+	if s.enableProfileCaching {
+		initProfileCache(s, stopCh, false)
+	}
+	if s.enableTracing && s.redisClient != nil {
+		initTraceCache(s, stopCh)
+	}
+	if s.redisClient != nil {
+		klog.Info("Initializing gateway snapshot sync and running-requests liveness heartbeat")
+		initGatewaySnapshotSync(s, stopCh)
+		initRunningRequestsLiveness(s, stopCh)
+	}
+	if opts.EnableKVSync {
+		if err := s.initKVEventSync(); err != nil {
+			// KV sync is optional; discovery remains usable if it fails.
+			klog.ErrorS(err, "Initialize KV event synchronization")
+		}
+	}
+	return nil
+}
+
 func (s *Store) startOwnedTask(task func()) bool {
-	s.ownedMu.Lock()
-	defer s.ownedMu.Unlock()
-	if s.closing {
+	if s.closing.Load() {
 		return false
 	}
-	if s.lifetimeCtx == nil {
-		go task()
-		return true
+	if s.ownedTasks != nil {
+		return s.ownedTasks.Start(task)
 	}
-	s.ownedTasks.Add(1)
-	go func() { defer s.ownedTasks.Done(); task() }()
+	go task()
 	return true
 }
 

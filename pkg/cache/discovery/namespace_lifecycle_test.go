@@ -68,6 +68,10 @@ func TestNamespacedFixtureRejectsForeignPrefixPaths(t *testing.T) {
 }
 
 func namespaceReply(w http.ResponseWriter, r *http.Request) {
+	namespaceListReply(w, r, metav1.ListMeta{ResourceVersion: "1"})
+}
+
+func namespaceListReply(w http.ResponseWriter, r *http.Request, meta metav1.ListMeta) {
 	if !managedDiscoveryPath(r.URL.Path) {
 		http.NotFound(w, r)
 		return
@@ -83,14 +87,27 @@ func namespaceReply(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/namespaces/managed":
 		_ = json.NewEncoder(w).Encode(&v1.Namespace{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"}, ObjectMeta: metav1.ObjectMeta{Name: "managed"}})
 	case strings.HasSuffix(r.URL.Path, "/pods"):
-		_ = json.NewEncoder(w).Encode(&v1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}})
+		_ = json.NewEncoder(w).Encode(&v1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, ListMeta: meta})
 	case strings.HasSuffix(r.URL.Path, "/modeladapters"):
-		_ = json.NewEncoder(w).Encode(&modelv1alpha1.ModelAdapterList{TypeMeta: metav1.TypeMeta{APIVersion: "model.aibrix.ai/v1alpha1", Kind: "ModelAdapterList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}})
+		_ = json.NewEncoder(w).Encode(&modelv1alpha1.ModelAdapterList{TypeMeta: metav1.TypeMeta{APIVersion: "model.aibrix.ai/v1alpha1", Kind: "ModelAdapterList"}, ListMeta: meta})
 	case strings.HasSuffix(r.URL.Path, "/modelclaims"):
-		_ = json.NewEncoder(w).Encode(&modelv1alpha1.ModelClaimList{TypeMeta: metav1.TypeMeta{APIVersion: "model.aibrix.ai/v1alpha1", Kind: "ModelClaimList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}})
+		_ = json.NewEncoder(w).Encode(&modelv1alpha1.ModelClaimList{TypeMeta: metav1.TypeMeta{APIVersion: "model.aibrix.ai/v1alpha1", Kind: "ModelClaimList"}, ListMeta: meta})
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func discoveryAccessError(w http.ResponseWriter, code int) {
+	reason := metav1.StatusReasonForbidden
+	if code == http.StatusNotFound {
+		reason = metav1.StatusReasonNotFound
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	// A canceled client may disconnect before the fixture finishes writing.
+	_ = json.NewEncoder(w).Encode(&metav1.Status{
+		TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: reason, Code: int32(code),
+	})
 }
 
 func TestNamespaceConfigurationFailsBeforeIO(t *testing.T) {
@@ -122,14 +139,11 @@ func TestNamespacedStartupRejectsUnavailableNamespaceBeforeDiscovery(t *testing.
 				w.Header().Set("Content-Type", "application/json")
 				// Response write errors are irrelevant to the client-side startup result.
 				if condition == "missing" || condition == "forbidden" {
-					code, reason := http.StatusNotFound, metav1.StatusReasonNotFound
-					if condition == "forbidden" {
-						code, reason = http.StatusForbidden, metav1.StatusReasonForbidden
+					code := http.StatusForbidden
+					if condition == "missing" {
+						code = http.StatusNotFound
 					}
-					w.WriteHeader(code)
-					_ = json.NewEncoder(w).Encode(&metav1.Status{
-						TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: reason, Code: int32(code),
-					})
+					discoveryAccessError(w, code)
 					return
 				}
 				namespace := &v1.Namespace{TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
@@ -167,16 +181,7 @@ func TestNamespacedOptionalClaimsCanBeAbsent(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/modelclaims") {
 					claimRequests.Add(1)
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(code)
-					reason := metav1.StatusReasonForbidden
-					if code == http.StatusNotFound {
-						reason = metav1.StatusReasonNotFound
-					}
-					// A canceled client may disconnect before this fixture finishes writing.
-					_ = json.NewEncoder(w).Encode(&metav1.Status{
-						TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: reason, Code: int32(code),
-					})
+					discoveryAccessError(w, code)
 					return
 				}
 				namespaceReply(w, r)
@@ -197,39 +202,54 @@ func TestNamespacedOptionalClaimsCanBeAbsent(t *testing.T) {
 }
 
 func TestNamespacedRequestsIncludeHealthAndOptionalClaims(t *testing.T) {
-	var mu sync.Mutex
-	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requests = append(requests, r.URL.Path+"?"+r.URL.RawQuery)
-		mu.Unlock()
-		namespaceReply(w, r)
-	}))
-	defer server.Close()
-	p, err := NewKubernetesProviderForNamespace(&rest.Config{Host: server.URL}, "managed")
-	require.NoError(t, err)
-	p.WithModelClaims().WithModelListHealth(time.Minute)
-	lifetime, cancel := context.WithCancel(context.Background())
-	defer func() { cancel(); p.Shutdown() }()
-	startup, stop := context.WithTimeout(lifetime, 5*time.Second)
-	defer stop()
-	require.NoError(t, p.WatchNamespaced(startup, lifetime, func(context.Context, WatchEvent) (bool, error) { return true, nil }))
-	stop() // Successful startup cancellation must not stop live discovery.
-	require.NoError(t, p.ModelListHealth().EnsureVerified(lifetime))
-	mu.Lock()
-	defer mu.Unlock()
-	var lists, watches int
-	for _, request := range requests {
-		requestPath, _, _ := strings.Cut(request, "?")
-		require.True(t, managedDiscoveryPath(requestPath), "%s", request)
-		if strings.Contains(request, "watch=true") {
-			watches++
-		} else {
-			lists++
-		}
+	for _, api := range []string{"namespaced", "stop-channel"} {
+		t.Run(api, func(t *testing.T) {
+			var mu sync.Mutex
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				requests = append(requests, r.URL.Path+"?"+r.URL.RawQuery)
+				mu.Unlock()
+				installationAPI(w, r)
+			}))
+			defer server.Close()
+			p, err := NewKubernetesProviderForNamespace(&rest.Config{Host: server.URL}, "managed")
+			require.NoError(t, err)
+			p.WithModelClaims().WithModelListHealth(time.Minute)
+			lifetime, cancel := context.WithCancel(context.Background())
+			defer func() { cancel(); p.Shutdown() }()
+			startup, stop := context.WithTimeout(lifetime, 5*time.Second)
+			defer stop()
+			if api == "namespaced" {
+				err = p.WatchNamespaced(startup, lifetime, func(context.Context, WatchEvent) (bool, error) { return true, nil })
+			} else {
+				err = p.WatchContext(startup, func(WatchEvent) bool { return true }, lifetime.Done())
+			}
+			require.NoError(t, err)
+			stop() // Successful startup cancellation must not stop live discovery.
+			require.NoError(t, p.ModelListHealth().EnsureVerified(lifetime))
+			mu.Lock()
+			defer mu.Unlock()
+			var lists, watches int
+			continuations := make(map[string]bool)
+			for _, request := range requests {
+				requestPath, _, _ := strings.Cut(request, "?")
+				require.True(t, managedDiscoveryPath(requestPath), "%s", request)
+				if strings.Contains(request, "continue=page-two") {
+					continuations[requestPath] = true
+				}
+				if strings.Contains(request, "watch=true") {
+					watches++
+				} else {
+					lists++
+				}
+			}
+			require.True(t, continuations["/api/v1/namespaces/managed/pods"])
+			require.True(t, continuations["/apis/model.aibrix.ai/v1alpha1/namespaces/managed/modeladapters"])
+			require.GreaterOrEqual(t, watches, 4, "required sources have independent watch probes and live watches")
+			require.GreaterOrEqual(t, lists, 7, "include Namespace, probes, initial lists, and verification")
+		})
 	}
-	require.GreaterOrEqual(t, watches, 4, "required sources have independent watch probes and live watches")
-	require.GreaterOrEqual(t, lists, 7, "include Namespace, probes, initial lists, and verification")
 }
 
 func TestNamespacedRequiredAccessFailures(t *testing.T) {
@@ -240,16 +260,7 @@ func TestNamespacedRequiredAccessFailures(t *testing.T) {
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						isWatch := r.URL.Query().Get("watch") == "true"
 						if strings.HasSuffix(r.URL.Path, "/"+resource) && isWatch == (verb == "watch") {
-							w.Header().Set("Content-Type", "application/json")
-							w.WriteHeader(code)
-							reason := metav1.StatusReasonForbidden
-							if code == http.StatusNotFound {
-								reason = metav1.StatusReasonNotFound
-							}
-							// A fixture response write may fail after client cancellation.
-							_ = json.NewEncoder(w).Encode(&metav1.Status{
-								TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: reason, Code: int32(code),
-							})
+							discoveryAccessError(w, code)
 							return
 						}
 						namespaceReply(w, r)

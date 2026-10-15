@@ -54,13 +54,19 @@ func (o *OwnedTasks) Start(task func()) bool {
 	return true
 }
 
-// Close stops admission, cancels Context, and awaits every admitted task.
-// It is safe to call concurrently and must not be called by an owned task.
-func (o *OwnedTasks) Close() {
+// Cancel stops admission and cancels Context without waiting for tasks.
+// Use it before closing dependencies needed to unblock tasks, then call Close.
+func (o *OwnedTasks) Cancel() {
 	o.mu.Lock()
 	o.closing = true
 	o.cancel()
 	o.mu.Unlock()
+}
+
+// Close stops admission, cancels Context, and awaits every admitted task.
+// It is safe to call concurrently and must not be called by an owned task.
+func (o *OwnedTasks) Close() {
+	o.Cancel()
 	o.wg.Wait()
 }
 

@@ -173,7 +173,7 @@ func (p *KubernetesProvider) WatchNamespaced(startupCtx, lifetimeCtx context.Con
 			ListFunc:  func(opts metav1.ListOptions) (runtime.Object, error) { return source.list(runCtx, opts) },
 			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) { return source.watch(runCtx, opts) },
 		}, source.object, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-		registration, registerErr := informer.AddEventHandler(p.eventHandlers(deliver))
+		registration, registerErr := informer.AddEventHandler(eventHandlers(deliver))
 		if registerErr != nil {
 			return registerErr
 		}
@@ -250,28 +250,9 @@ func preserveDiscoveryCancellation(err error, startup, lifetime context.Context)
 // handler or changing required-source health. Claims must use required=false.
 // The returned bool reports application; rejection is false with no error.
 func (p *KubernetesProvider) DispatchNamespaced(ctx context.Context, ev WatchEvent, required bool, handler func(context.Context, WatchEvent) (bool, error)) (bool, error) {
-	if tombstone, ok := ev.Object.(cache.DeletedFinalStateUnknown); ok {
-		ev.Object = tombstone.Obj
-	}
-	if tombstone, ok := ev.Object.(*cache.DeletedFinalStateUnknown); ok && tombstone != nil {
-		ev.Object = tombstone.Obj
-	}
-	obj := namespacedMetadata(ev.Object)
-	if obj == nil {
+	ev.Object = unwrapDeletedObject(ev.Object)
+	if !ev.InNamespace(p.namespace) {
 		return false, nil
-	}
-	if obj.GetNamespace() != p.namespace {
-		klog.Warningf("Ignored foreign discovery event: %T %s/%s (installation %s)", ev.Object, obj.GetNamespace(), obj.GetName(), p.namespace)
-		return false, nil
-	}
-	if ev.Type == EventUpdate {
-		old := namespacedMetadata(ev.OldObject)
-		if old == nil || old.GetNamespace() != p.namespace {
-			if old != nil {
-				klog.Warningf("Ignored foreign discovery update: %T %s/%s (installation %s)", ev.OldObject, old.GetNamespace(), old.GetName(), p.namespace)
-			}
-			return false, nil
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -323,11 +304,11 @@ func namespacedMetadata(obj interface{}) metav1.Object {
 	return nil
 }
 
-func (p *KubernetesProvider) eventHandlers(delivery func(WatchEvent)) cache.ResourceEventHandlerFuncs {
+func eventHandlers(delivery func(WatchEvent)) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { delivery(WatchEvent{Type: EventAdd, Object: obj}) },
 		UpdateFunc: func(old, obj interface{}) { delivery(WatchEvent{Type: EventUpdate, Object: obj, OldObject: old}) },
-		DeleteFunc: func(obj interface{}) { delivery(WatchEvent{Type: EventDelete, Object: obj}) },
+		DeleteFunc: func(obj interface{}) { delivery(WatchEvent{Type: EventDelete, Object: unwrapDeletedObject(obj)}) },
 	}
 }
 
@@ -388,51 +369,35 @@ func (p *KubernetesProvider) WithEventCompletion(complete func(context.Context, 
 	return p
 }
 
-func (p *KubernetesProvider) acceptEvent(ev WatchEvent) bool {
-	if p.namespace == "" {
-		return true
+// InNamespace checks both sides of an update and only accepts supported,
+// non-nil discovery objects. An empty namespace is matched literally; callers
+// permitting cluster-wide discovery must bypass this guard explicitly.
+func (ev WatchEvent) InNamespace(namespace string) bool {
+	objects := []any{ev.Object, ev.OldObject}
+	if ev.Type != EventUpdate {
+		objects = objects[:1]
 	}
-	obj := eventMetadata(ev.Object)
-	if obj == nil || obj.GetNamespace() != p.namespace {
-		if obj != nil {
-			klog.Warningf("Ignored discovery object outside installation namespace: %s/%s", obj.GetNamespace(), obj.GetName())
+	for _, obj := range objects {
+		metadata := namespacedMetadata(obj)
+		if metadata == nil {
+			return false
 		}
-		return false
-	}
-	if ev.Type == EventUpdate {
-		old := eventMetadata(ev.OldObject)
-		if old == nil || old.GetNamespace() != p.namespace {
-			if old != nil {
-				klog.Warningf("Ignored discovery update from outside installation namespace: %s/%s", old.GetNamespace(), old.GetName())
-			}
+		if metadata.GetNamespace() != namespace {
+			klog.Warningf("Ignored foreign discovery event: %T %s/%s (installation %s)", obj, metadata.GetNamespace(), metadata.GetName(), namespace)
 			return false
 		}
 	}
 	return true
 }
 
-func eventMetadata(obj interface{}) metav1.Object {
+func unwrapDeletedObject(obj any) any {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
 	if tombstone, ok := obj.(*cache.DeletedFinalStateUnknown); ok && tombstone != nil {
 		obj = tombstone.Obj
 	}
-	switch typed := obj.(type) {
-	case *v1.Pod:
-		if typed != nil {
-			return typed
-		}
-	case *modelv1alpha1.ModelAdapter:
-		if typed != nil {
-			return typed
-		}
-	case *modelv1alpha1.ModelClaim:
-		if typed != nil {
-			return typed
-		}
-	}
-	return nil
+	return obj
 }
 
 // WatchContext is the compatibility form for callers using a stop channel.

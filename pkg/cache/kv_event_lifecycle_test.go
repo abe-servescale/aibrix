@@ -25,6 +25,7 @@ import (
 	"github.com/vllm-project/aibrix/pkg/cache/discovery"
 	"github.com/vllm-project/aibrix/pkg/constants"
 	"github.com/vllm-project/aibrix/pkg/kvevent"
+	"github.com/vllm-project/aibrix/pkg/utils"
 	"k8s.io/client-go/rest"
 )
 
@@ -44,7 +45,8 @@ func TestEnabledKVCompletionReleasesMembershipAndHealthBeforeIO(t *testing.T) {
 	t.Setenv(constants.EnvPrefixCacheKVEventSyncEnabled, "true")
 	t.Setenv(constants.EnvPrefixCacheUseRemoteTokenizer, "true")
 	st := NewForTest()
-	st.lifetimeCtx, st.cancelLifetime = context.WithCancel(context.Background())
+	st.ownedTasks = utils.NewOwnedTasks(context.Background())
+	st.lifetimeCtx = st.ownedTasks.Context()
 	defer st.Close()
 	p, err := discovery.NewKubernetesProviderForNamespace(&rest.Config{Host: "http://127.0.0.1:1"}, "models")
 	require.NoError(t, err)

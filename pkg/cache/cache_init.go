@@ -31,7 +31,6 @@ import (
 	"k8s.io/klog/v2"
 
 	prometheusv1 "github.com/prometheus/client_golang/api/prometheus/v1"
-	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
 	"github.com/vllm-project/aibrix/pkg/cache/discovery"
 	"github.com/vllm-project/aibrix/pkg/constants"
 	"github.com/vllm-project/aibrix/pkg/metrics"
@@ -93,12 +92,10 @@ type Store struct {
 	prepareRouterMu       sync.Mutex
 	preparedRouters       utils.SyncMap[string, *preparedModelRouter]
 	gatewayCleanup        func()
-	cancelLifetime        context.CancelFunc
 	closeOnce             sync.Once
 	backgroundOnce        sync.Once
-	ownedTasks            sync.WaitGroup
-	ownedMu               sync.Mutex
-	closing               bool
+	ownedTasks            *utils.OwnedTasks
+	closing               atomic.Bool
 	// Namespace actually synchronized by Kubernetes discovery. Empty means
 	// unconfined or non-Kubernetes discovery, regardless of caller options.
 	installationNamespace string
@@ -462,18 +459,9 @@ func InitWithContext(ctx context.Context, config *rest.Config, stopCh <-chan str
 		return st, nil
 	}
 
-	return initWithContextLegacy(ctx, config, stopCh, opts)
-}
-
-func initWithContextLegacy(ctx context.Context, config *rest.Config, stopCh <-chan struct{}, opts InitOptions) (*Store, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	provider, err := gatewayDiscoveryProvider(config, opts)
-	if err != nil {
-		return nil, err
-	}
-	opts.DiscoveryProvider = provider
 	once.Do(func() {
 		defer func() {
 			if initErr != nil {
@@ -529,49 +517,11 @@ func initWithContextLegacy(ctx context.Context, config *rest.Config, stopCh <-ch
 			store.installationNamespace = kubernetesProvider.Namespace()
 		}
 		klog.InfoS("Using discovery provider", "type", provider.Type())
-		initMetricsCache(store, stopCh)
-
-		// Initialize profile cache if enabled
-		if store.enableProfileCaching {
-			initProfileCache(store, stopCh, false)
-		}
-
-		// Initialize trace cache if enabled and Redis is available
-		if store.enableTracing && opts.RedisClient != nil {
-			initTraceCache(store, stopCh)
-		}
-
-		// Initialize gateway snapshot sync if Redis is available
-		if opts.RedisClient != nil {
-			klog.Info("Initializing gateway snapshot sync")
-			initGatewaySnapshotSync(store, stopCh)
-		}
-
-		// Initialize the real-time running-requests liveness heartbeat if Redis is
-		// available -- see cache_running_requests.go.
-		if opts.RedisClient != nil {
-			klog.Info("Initializing running-requests liveness heartbeat")
-			initRunningRequestsLiveness(store, stopCh)
-		}
-
-		// Initialize KV event sync if enabled
-		if opts.EnableKVSync {
-			if opts.RedisClient == nil {
-				initErr = fmt.Errorf("KV event synchronization requires Redis")
-				return
-			}
-			if err := store.initKVEventSync(); err != nil {
-				klog.Errorf("Failed to initialize KV event sync: %v", err)
-				// Continue without KV sync - this is not a fatal error
-			}
-		}
+		initErr = store.startBackground(opts, stopCh)
 	})
 
 	if initErr != nil {
 		return nil, initErr
-	}
-	if opts.IsGateway && provider != nil && provider.Type() == "kubernetes" && store.installationNamespace != opts.InstallationNamespace {
-		return nil, fmt.Errorf("cache already belongs to a different or unconfined installation namespace")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -674,66 +624,16 @@ func initDiscoveryProviderContext(ctx context.Context, store *Store, provider di
 }
 
 func handleDiscoveryObject(store *Store, evType discovery.EventType, obj, oldObj any) bool {
-	if store.installationNamespace != "" {
-		metadata, ok := obj.(interface {
-			GetNamespace() string
-			GetName() string
-		})
-		if !ok || metadata.GetNamespace() != store.installationNamespace {
-			return false
-		}
-		if evType == discovery.EventUpdate {
-			old, ok := oldObj.(interface {
-				GetNamespace() string
-				GetName() string
-			})
-			if !ok || old.GetNamespace() != store.installationNamespace {
-				return false
-			}
-		}
-	}
-
-	switch o := obj.(type) {
-	case *v1.Pod:
-		switch evType {
-		case discovery.EventAdd:
-			store.addPod(o)
-		case discovery.EventUpdate:
-			oldPod, ok := oldObj.(*v1.Pod)
-			if !ok {
-				klog.Errorf("Pod update event for %s/%s with incorrect old object type: %T", o.Namespace, o.Name, oldObj)
-				return false
-			}
-			store.updatePod(oldPod, o)
-		case discovery.EventDelete:
-			store.deletePod(o)
-		}
-	case *modelv1alpha1.ModelAdapter:
-		switch evType {
-		case discovery.EventAdd:
-			store.addModelAdapter(o)
-		case discovery.EventUpdate:
-			oldAdapter, ok := oldObj.(*modelv1alpha1.ModelAdapter)
-			if !ok {
-				klog.Errorf("ModelAdapter update event for %s/%s with incorrect old object type: %T", o.Namespace, o.Name, oldObj)
-				return false
-			}
-			store.updateModelAdapter(oldAdapter, o)
-		case discovery.EventDelete:
-			store.deleteModelAdapter(o)
-		}
-	case *modelv1alpha1.ModelClaim:
-		switch evType {
-		case discovery.EventAdd, discovery.EventUpdate:
-			store.setModelClaim(o)
-		case discovery.EventDelete:
-			store.deleteModelClaim(o)
-		}
-	default:
-		klog.Warningf("Discovery event with unknown object type: %T", obj)
+	ev := discovery.WatchEvent{Type: evType, Object: obj, OldObject: oldObj}
+	applied, err := handleDiscoveryObjectContext(context.Background(), store, ev)
+	if err != nil {
+		klog.ErrorS(err, "Apply discovery event", "type", evType)
 		return false
 	}
-	return true
+	if applied {
+		_ = store.notifyKVEvent(context.Background(), ev)
+	}
+	return applied
 }
 
 // initMetricsCache initializes metrics cache update loop
@@ -909,11 +809,9 @@ func (s *Store) GetSyncPrefixIndexer() *syncindexer.SyncPrefixHashTable {
 func (s *Store) Close() { s.closeOnce.Do(s.close) }
 
 func (s *Store) close() {
-	s.ownedMu.Lock()
-	s.closing = true
-	s.ownedMu.Unlock()
-	if s.cancelLifetime != nil {
-		s.cancelLifetime()
+	s.closing.Store(true)
+	if s.ownedTasks != nil {
+		s.ownedTasks.Cancel()
 	}
 	s.backgroundOnce.Do(func() {})
 	if s.gatewayCleanup != nil {
@@ -925,7 +823,9 @@ func (s *Store) close() {
 		}
 		return true
 	})
-	s.ownedTasks.Wait()
+	if s.ownedTasks != nil {
+		s.ownedTasks.Close()
+	}
 
 	klog.Info("Closing cache store")
 

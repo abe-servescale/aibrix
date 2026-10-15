@@ -244,7 +244,7 @@ func (p *KubernetesProvider) watchContext(ctx context.Context, handler func(Watc
 }
 
 func (p *KubernetesProvider) deliver(ev WatchEvent, required bool, handler func(WatchEvent) bool) {
-	if !p.acceptEvent(ev) {
+	if p.namespace != "" && !ev.InNamespace(p.namespace) {
 		return
 	}
 	if required && p.modelListHealth != nil {
@@ -255,21 +255,9 @@ func (p *KubernetesProvider) deliver(ev WatchEvent, required bool, handler func(
 }
 
 func (p *KubernetesProvider) registerHandler(inf cache.SharedIndexInformer, required bool, handler func(WatchEvent) bool) (cache.ResourceEventHandlerRegistration, error) {
-	registration, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) { p.deliver(WatchEvent{Type: EventAdd, Object: obj}, required, handler) },
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			p.deliver(WatchEvent{Type: EventUpdate, Object: newObj, OldObject: oldObj}, required, handler)
-		},
-		DeleteFunc: func(obj interface{}) {
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tombstone.Obj
-			}
-			if tombstone, ok := obj.(*cache.DeletedFinalStateUnknown); ok && tombstone != nil {
-				obj = tombstone.Obj
-			}
-			p.deliver(WatchEvent{Type: EventDelete, Object: obj}, required, handler)
-		},
-	})
+	registration, err := inf.AddEventHandler(eventHandlers(func(ev WatchEvent) {
+		p.deliver(ev, required, handler)
+	}))
 	if err != nil {
 		return nil, err
 	}

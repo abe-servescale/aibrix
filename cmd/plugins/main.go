@@ -204,19 +204,11 @@ func runGateway() error {
 	klog.InitFlags(flag.CommandLine)
 	defer klog.Flush()
 	flag.Parse()
-	if err := kubeAPI.validate(); err != nil {
-		return err
-	}
-	if err := modelDiscovery.validateForMode(standalone); err != nil {
+	if err := validateStartupOptions(kubeAPI, modelDiscovery, standalone, endpointsConfig); err != nil {
 		return err
 	}
 
 	httpAddr = resolveHTTPAddress(httpAddr, metricsAddr)
-
-	// Validate standalone mode flags
-	if standalone && endpointsConfig == "" {
-		return errors.New("--endpoints-config is required when running in standalone mode")
-	}
 
 	redisClient, err := prepareGatewayRedis(standalone)
 	if err != nil {
@@ -543,48 +535,16 @@ func initializeGatewayTelemetry(startupCtx context.Context) (*utils.Telemetry, [
 	return telApp, opts, nil
 }
 
-func kubernetesDiscoveryClients(kubeAPI kubeAPIOptions, models modelDiscoveryOptions) (
-	*rest.Config, kubernetes.Interface, versioned.Interface, discovery.Provider, error,
-) {
-	kubeConfig := flag.Lookup("kubeconfig").Value.String()
-	var config *rest.Config
-	var err error
-	if kubeConfig == "" {
-		klog.Info("using in-cluster configuration")
-		config, err = rest.InClusterConfig()
-	} else {
-		klog.Infof("using configuration from '%s'", kubeConfig)
-		config, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
-	}
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("build kubeconfig: %w", err)
-	}
-	kubeAPI.applyTo(config)
-	core, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	gatewayClient, err := versioned.NewForConfig(config)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	provider, err := models.kubernetesProvider(config)
-	return config, core, gatewayClient, provider, err
-}
-
 func validateStartupOptions(
 	kubeAPI kubeAPIOptions, models modelDiscoveryOptions, standalone bool, endpoints string,
 ) error {
 	if err := kubeAPI.validate(); err != nil {
 		return err
 	}
-	if err := models.validate(); err != nil {
+	if err := models.validateForMode(standalone); err != nil {
 		return err
 	}
-	if !standalone {
-		return discovery.ValidateNamespace(models.namespace)
-	}
-	if endpoints == "" {
+	if standalone && endpoints == "" {
 		return fmt.Errorf("--endpoints-config is required when running in standalone mode")
 	}
 	return nil
